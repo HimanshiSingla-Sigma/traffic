@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header bg-primary text-white">
+                <h5 class="mb-0"><i class="bi bi-speedometer2"></i> Traffic Overview</h5>
+            </div>
+            <div class="card-body">
+                <div class="row" id="intersection-cards">
+                    <!-- Dynamic content will be loaded here -->
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mt-4">
+            <div class="card-header bg-info text-white">
+                <h5 class="mb-0"><i class="bi bi-map"></i> Live Traffic Map</h5>
+            </div>
+            <div class="card-body">
+                <div id="mini-map" style="height: 300px; background-color: #f0f0f0;">
+                    <!-- Mini map will be implemented with Leaflet in a real application -->
+                    <div class="d-flex justify-content-center align-items-center h-100">
+                        <p class="text-muted">Live traffic map visualization</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header bg-warning text-dark">
+                <h5 class="mb-0"><i class="bi bi-exclamation-triangle"></i> Alerts</h5>
+            </div>
+            <div class="card-body p-0">
+                <ul class="list-group list-group-flush" id="alerts-list">
+                    <!-- Alerts will be loaded here -->
+                </ul>
+            </div>
+        </div>
+        
+        <div class="card mt-4">
+            <div class="card-header bg-success text-white">
+                <h5 class="mb-0"><i class="bi bi-graph-up"></i> System Status</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-6">
+                        <div class="card bg-light mb-3">
+                            <div class="card-body text-center">
+                                <h2 id="total-intersections">4</h2>
+                                <p class="card-text">Intersections</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="card bg-light mb-3">
+                            <div class="card-body text-center">
+                                <h2 id="active-interventions">0</h2>
+                                <p class="card-text">Active Interventions</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="progress mb-2">
+                    <div class="progress-bar" role="progressbar" style="width: 75%" id="system-status-bar"></div>
+                </div>
+                <p class="text-center small" id="system-status-text">System operating normally</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // Load initial data
+        fetch('/api/traffic-data')
+            .then(response => response.json())
+            .then(data => updateIntersectionCards(data));
+            
+        fetch('/api/alerts')
+            .then(response => response.json())
+            .then(data => updateAlertsList(data));
+            
+        // Connect to SocketIO for real-time updates
+        const socket = io();
+        socket.on('traffic_update', function(data) {
+            // Refresh data on update
+            fetch('/api/traffic-data')
+                .then(response => response.json())
+                .then(data => updateIntersectionCards(data));
+        });
+        
+        socket.on('new_alert', function(data) {
+            // Add new alert to the top of the list
+            addNewAlert(data);
+        });
+    });
+    
+    function updateIntersectionCards(data) {
+        const container = document.getElementById('intersection-cards');
+        container.innerHTML = '';
+        
+        data.forEach(intersection => {
+            const riskPercent = Math.round(intersection.risk_score * 100);
+            let riskClass = 'bg-success';
+            if (riskPercent > 70) riskClass = 'bg-danger';
+            else if (riskPercent > 40) riskClass = 'bg-warning';
+            
+            const card = `
+                <div class="col-md-6 mb-3">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h5 class="card-title">${intersection.name}</h5>
+                            <div class="row">
+                                <div class="col-6">
+                                    <p class="card-text mb-0">Vehicles: <strong>${intersection.vehicle_count}</strong></p>
+                                    <p class="card-text">Avg Speed: <strong>${intersection.avg_speed.toFixed(1)} km/h</strong></p>
+                                </div>
+                                <div class="col-6">
+                                    <p class="card-text mb-0">Congestion: <span class="badge bg-secondary">${intersection.congestion_level}</span></p>
+                                    <p class="card-text">Risk: <span class="badge ${riskClass}">${riskPercent}%</span></p>
+                                </div>
+                            </div>
+                            <button class="btn btn-sm btn-outline-primary mt-2" onclick="triggerIntervention(${intersection.id}, 'adjust_timing')">Adjust Timing</button>
+                            <button class="btn btn-sm btn-outline-warning mt-2" onclick="triggerIntervention(${intersection.id}, 'alert')">Send Alert</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            container.innerHTML += card;
+        });
+    }
+    
+    function updateAlertsList(data) {
+        const list = document.getElementById('alerts-list');
+        list.innerHTML = '';
+        
+        if (data.length === 0) {
+            list.innerHTML = '<li class="list-group-item text-center text-muted">No active alerts</li>';
+            return;
+        }
+        
+        data.forEach(alert => {
+            let alertClass = 'list-group-item';
+            if (alert.severity === 'danger') alertClass += ' list-group-item-danger';
+            else if (alert.severity === 'warning') alertClass += ' list-group-item-warning';
+            else alertClass += ' list-group-item-info';
+            
+            const date = new Date(alert.timestamp);
+            const timeString = date.toLocaleTimeString();
+            
+            const item = `
+                <li class="${alertClass}">
+                    <div class="d-flex w-100 justify-content-between">
+                        <h6 class="mb-1">${alert.message}</h6>
+                        <small>${timeString}</small>
+                    </div>
+                    <p class="mb-1">Location: ${alert.location}</p>
+                </li>
+            `;
+            list.innerHTML += item;
+        });
+    }
+    
+    function addNewAlert(alert) {
+        const list = document.getElementById('alerts-list');
+        
+        // Remove the "no alerts" message if present
+        if (list.innerHTML.includes('No active alerts')) {
+            list.innerHTML = '';
+        }
+        
+        let alertClass = 'list-group-item';
+        if (alert.severity === 'danger') alertClass += ' list-group-item-danger';
+        else if (alert.severity === 'warning') alertClass += ' list-group-item-warning';
+        else alertClass += ' list-group-item-info';
+        
+        const date = new Date(alert.timestamp);
+        const timeString = date.toLocaleTimeString();
+        
+        const item = `
+            <li class="${alertClass}">
+                <div class="d-flex w-100 justify-content-between">
+                    <h6 class="mb-1">${alert.message}</h6>
+                    <small>${timeString}</small>
+                </div>
+                <p class="mb-1">Location: ${alert.location}</p>
+            </li>
+        `;
+        
+        // Add to the top of the list
+        list.innerHTML = item + list.innerHTML;
+    }
+    
+    function triggerIntervention(intersectionId, type) {
+        fetch('/api/intervene', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                intersection_id: intersectionId,
+                type: type
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'success') {
+                alert('Intervention triggered successfully!');
+            }
+        });
+    }
+</script>
+{% endblock %}
