@@ -151,7 +151,7 @@
 
 
 
-# four lanes -> incorrect
+#  four lanes -> correct
 # from flask import Flask, render_template, Response, jsonify
 # from ultralytics import YOLO
 # import cv2
@@ -159,598 +159,2057 @@
 # from collections import defaultdict
 # import time
 # import threading
+# import copy
 
 # app = Flask(__name__)
 
-# # Initialize YOLOv8 model
-# model = YOLO('yolov8n.pt')
-
-# # Define vehicle classes of interest (COCO Dataset Class IDs)
+# # --- Configuration ---
+# MODEL = YOLO('yolov8n.pt')
 # VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
-# class_names = model.names
-
-# # Traffic light states
-# TRAFFIC_LIGHT_STATES = {
-#     'RED': 0,
-#     'YELLOW': 1, 
-#     'GREEN': 2
+# CLASS_NAMES = MODEL.names
+# LANE_IDS = [1, 2, 3, 4]
+# VIDEO_SOURCES = {
+#     1: 'videos/lane1.mp4',
+#     2: 'videos/lane2.mp4',
+#     3: 'videos/lane3.mp4',
+#     4: 'videos/lane4.mp4',
 # }
 
-# # Global data structure for all 4 lanes
-# lanes_data = {}
-# for lane_id in range(1, 5):
-#     lanes_data[lane_id] = {
-#         'current_counts': {'car': 0, 'bus': 0, 'truck': 0, 'motorcycle': 0},
+# # --- Global Data Structures & Threading Lock ---
+# traffic_data = {}
+# lock = threading.Lock()        # protects traffic_data
+# yolo_lock = threading.Lock()   # protects first call to YOLO
+
+# for lane_id in LANE_IDS:
+#     traffic_data[lane_id] = {
+#         'current_counts': defaultdict(int),
 #         'total_count': 0,
+#         'latest_frame': None,
+#         'green_time': 10,
 #         'density_history': [],
 #         'timing_history': [],
-#         'time_labels': [],
-#         'current_light': 'RED',
-#         'green_time_remaining': 0,
-#         'video_source': f'videos/lane{lane_id}.mp4'
+#         'time_labels': []
 #     }
 
-# lock = threading.Lock()
-# current_green_lane = 1
-# light_change_time = time.time()
-# YELLOW_LIGHT_DURATION = 3  # seconds
-# MIN_GREEN_TIME = 10        # seconds
-# MAX_GREEN_TIME = 60        # seconds
-
+# # --- Core Logic ---
 # def calculate_green_time(vehicle_count):
-#     """Calculate green time based on vehicle count with min/max limits"""
-#     time_per_vehicle = 2  # seconds per vehicle
-#     calculated_time = MIN_GREEN_TIME + (vehicle_count * time_per_vehicle)
-#     return min(calculated_time, MAX_GREEN_TIME)
+#     base_time = 10
+#     time_per_vehicle = 2
+#     max_time = 60
+#     return min(base_time + vehicle_count * time_per_vehicle, max_time)
 
-# def manage_traffic_lights():
-#     """Manage the traffic light cycle for all lanes"""
-#     global current_green_lane, light_change_time, lanes_data
-    
+# def process_video_for_lane(lane_id):
+#     video_path = VIDEO_SOURCES[lane_id]
+#     cap = cv2.VideoCapture(video_path)
+
+#     if not cap.isOpened():
+#         print(f"[ERROR] Could not open video for lane {lane_id}: {video_path}")
+#         return
+
+#     print(f"[INFO] Started processing for lane {lane_id}...")
+
 #     while True:
-#         with lock:
-#             current_time = time.time()
-#             elapsed = current_time - light_change_time
-            
-#             # Check if current green light time has expired
-#             current_green_time = lanes_data[current_green_lane]['green_time_remaining']
-            
-#             if elapsed >= current_green_time:
-#                 # Switch to next lane
-#                 next_lane = current_green_lane % 4 + 1
-                
-#                 # Set yellow light for current lane
-#                 lanes_data[current_green_lane]['current_light'] = 'YELLOW'
-#                 lanes_data[current_green_lane]['green_time_remaining'] = YELLOW_LIGHT_DURATION
-                
-#                 # After yellow duration, switch to green for next lane
-#                 time.sleep(YELLOW_LIGHT_DURATION)
-                
-#                 lanes_data[current_green_lane]['current_light'] = 'RED'
-#                 current_green_lane = next_lane
-#                 lanes_data[current_green_lane]['current_light'] = 'GREEN'
-                
-#                 # Calculate new green time based on current traffic
-#                 vehicle_count = lanes_data[current_green_lane]['total_count']
-#                 new_green_time = calculate_green_time(vehicle_count)
-#                 lanes_data[current_green_lane]['green_time_remaining'] = new_green_time
-                
-#                 light_change_time = time.time()
-                
-#                 print(f"Switched to Lane {current_green_lane} with {new_green_time}s green time")
-        
-#         time.sleep(0.1)  # Small delay to prevent CPU overload
-
-# def process_lane_video(lane_id):
-#     """Process video for a specific lane and count vehicles"""
-#     video_source = lanes_data[lane_id]['video_source']
-#     cap = cv2.VideoCapture(video_source)
-    
-#     while cap.isOpened():
-#         success, frame = cap.read()
-#         if not success:
+#         ok, frame = cap.read()
+#         if not ok:
 #             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 #             continue
 
-#         # Run YOLOv8 inference
-#         results = model.track(frame, persist=True, verbose=False, classes=VEHICLE_CLASSES)
-#         current_counts = defaultdict(int)
+#         # --- YOLO Inference (thread-safe) ---
+#         with yolo_lock:
+#             results = MODEL.track(frame, persist=True, verbose=False,
+#                                   classes=VEHICLE_CLASSES)
 
-#         if results[0].boxes.id is not None:
+#         current_counts = defaultdict(int)
+#         if results and results[0].boxes.id is not None:
 #             boxes = results[0].boxes.xyxy.cpu().numpy()
 #             class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
-            
-#             for box, class_id in zip(boxes, class_ids):
-#                 label = class_names[class_id]
-#                 if label in ['car', 'bus', 'truck', 'motorcycle']:
-#                     current_counts[label] += 1
 
-#         # Update lane data
-#         total_vehicles = sum(current_counts.values())
-        
+#             for box, cid in zip(boxes, class_ids):
+#                 label = CLASS_NAMES[cid]
+#                 current_counts[label] += 1
+#                 x1, y1, x2, y2 = map(int, box)
+#                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+#                 cv2.putText(frame, label, (x1, y1 - 8),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+#         total = sum(current_counts.values())
+#         gtime = calculate_green_time(total)
+
+#         info = f"Total: {total} | Green Time: {gtime}s"
+#         cv2.putText(frame, f"Lane {lane_id}", (10, 30),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+#         cv2.putText(frame, info, (10, 70),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+#         ret, buf = cv2.imencode(".jpg", frame)
+#         frame_bytes = buf.tobytes()
+
+#         # --- Update global data safely ---
 #         with lock:
-#             lanes_data[lane_id]['current_counts'] = current_counts
-#             lanes_data[lane_id]['total_count'] = total_vehicles
-            
-#             # Update history every 5 seconds
-#             if len(lanes_data[lane_id]['time_labels']) == 0 or time.time() - lanes_data[lane_id]['time_labels'][-1] > 5:
-#                 lanes_data[lane_id]['density_history'].append(total_vehicles)
-#                 lanes_data[lane_id]['timing_history'].append(lanes_data[lane_id]['green_time_remaining'])
-#                 lanes_data[lane_id]['time_labels'].append(time.strftime("%H:%M:%S"))
-                
-#                 # Keep limited history
-#                 if len(lanes_data[lane_id]['density_history']) > 20:
-#                     lanes_data[lane_id]['density_history'].pop(0)
-#                     lanes_data[lane_id]['timing_history'].pop(0)
-#                     lanes_data[lane_id]['time_labels'].pop(0)
+#             lane = traffic_data[lane_id]
+#             lane["current_counts"] = current_counts
+#             lane["total_count"] = total
+#             lane["green_time"] = gtime
+#             lane["latest_frame"] = frame_bytes
 
-#         # Add traffic light visualization to frame
-#         light_color = lanes_data[lane_id]['current_light']
-#         light_colors = {'RED': (0, 0, 255), 'YELLOW': (0, 255, 255), 'GREEN': (0, 255, 0)}
-        
-#         # Draw traffic light
-#         cv2.rectangle(frame, (10, 10), (60, 160), (50, 50, 50), -1)
-#         cv2.circle(frame, (35, 35), 15, light_colors['RED'], -1 if light_color == 'RED' else -1)
-#         cv2.circle(frame, (35, 80), 15, light_colors['YELLOW'], -1 if light_color == 'YELLOW' else -1)
-#         cv2.circle(frame, (35, 125), 15, light_colors['GREEN'], -1 if light_color == 'GREEN' else -1)
-        
-#         # Add info text
-#         cv2.putText(frame, f"Lane {lane_id} - {light_color}", (70, 30), 
-#                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, light_colors[light_color], 2)
-#         cv2.putText(frame, f"Vehicles: {total_vehicles}", (70, 60), 
-#                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-#         cv2.putText(frame, f"Time: {lanes_data[lane_id]['green_time_remaining']}s", (70, 90), 
-#                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+#             now = time.time()
+#             last = lane["time_labels"][-1] if lane["time_labels"] else 0
+#             if now - last > 5:
+#                 lane["density_history"].append(total)
+#                 lane["timing_history"].append(gtime)
+#                 lane["time_labels"].append(now)
+#                 if len(lane["density_history"]) > 20:
+#                     lane["density_history"].pop(0)
+#                     lane["timing_history"].pop(0)
+#                     lane["time_labels"].pop(0)
 
-#         # Encode frame for streaming
-#         ret, buffer = cv2.imencode('.jpg', frame)
-#         yield buffer.tobytes()
-
-#     cap.release()
-
-# def generate_frames(lane_id):
-#     """Generator function for video streaming"""
-#     return process_lane_video(lane_id)
-
-# @app.route('/')
+# # --- Flask Routes ---
+# @app.route("/")
 # def index():
-#     return render_template('index.html')
+#     return render_template("index.html", lanes=LANE_IDS)
 
-# @app.route('/video_feed/<int:lane_id>')
+# def generate_video_stream(lane_id):
+#     while True:
+#         time.sleep(0.03)
+#         with lock:
+#             frame = traffic_data[lane_id]["latest_frame"]
+#         if frame is None:
+#             continue
+#         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+#                frame + b"\r\n")
+
+# @app.route("/video_feed/<int:lane_id>")
 # def video_feed(lane_id):
-#     return Response(generate_frames(lane_id),
-#                    mimetype='multipart/x-mixed-replace; boundary=frame')
+#     if lane_id not in LANE_IDS:
+#         return "Invalid Lane ID", 404
+#     return Response(generate_video_stream(lane_id),
+#                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
-# @app.route('/traffic_data')
+# @app.route("/traffic_data")
 # def get_traffic_data():
 #     with lock:
-#         data = {
+#         payload = {}
+#         for lid, data in traffic_data.items():
+#             d = {k: v for k, v in data.items() if k != "latest_frame"}
+#             d["time_labels"] = [time.strftime("%H:%M:%S", time.localtime(ts))
+#                                 for ts in d["time_labels"]]
+#             payload[lid] = d
+#     return jsonify(payload)
+
+# if __name__ == "__main__":
+#     for lid in LANE_IDS:
+#         t = threading.Thread(target=process_video_for_lane,
+#                              args=(lid,), daemon=True)
+#         t.start()
+#     app.run(debug=False, host="0.0.0.0", port=3001, threaded=True)
+
+
+
+
+
+
+
+
+
+# emergency vehicle prioritization
+# from flask import Flask, render_template, Response, jsonify
+# from ultralytics import YOLO
+# import cv2
+# import numpy as np
+# from collections import defaultdict
+# import time
+# import threading
+# import copy
+
+# app = Flask(__name__)
+
+# # --- Configuration ---
+# MODEL = YOLO('yolov8n.pt')
+# VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+# EMERGENCY_CLASSES = [0]  # person (can be extended to specific emergency vehicle classes)
+# # Note: You might want to train a custom model or use different classes for emergency vehicles
+# # Common emergency vehicle classes: ambulance, fire truck, police car
+# CLASS_NAMES = MODEL.names
+# LANE_IDS = [1, 2, 3, 4]
+# VIDEO_SOURCES = {
+#     1: 'videos/lane1.mp4',
+#     2: 'videos/lane2.mp4',
+#     3: 'videos/lane3.mp4',
+#     4: 'videos/lane4.mp4',
+# }
+
+# # --- Emergency Vehicle Detection Configuration ---
+# EMERGENCY_PRIORITY_THRESHOLD = 1  # Minimum emergency vehicles to trigger priority
+# EMERGENCY_GREEN_TIME = 20  # Extended green time for emergency lanes
+# PRIORITY_COOLDOWN = 30  # Seconds before another emergency can trigger priority
+
+# # --- Global Data Structures & Threading Lock ---
+# traffic_data = {}
+# emergency_status = {
+#     'active_emergency': False,
+#     'emergency_lane': None,
+#     'priority_end_time': 0,
+#     'cooldown_end_time': 0
+# }
+# lock = threading.Lock()        # protects traffic_data and emergency_status
+# yolo_lock = threading.Lock()   # protects first call to YOLO
+
+# for lane_id in LANE_IDS:
+#     traffic_data[lane_id] = {
+#         'current_counts': defaultdict(int),
+#         'emergency_count': 0,
+#         'total_count': 0,
+#         'latest_frame': None,
+#         'green_time': 10,
+#         'density_history': [],
+#         'timing_history': [],
+#         'time_labels': [],
+#         'has_emergency': False
+#     }
+
+# # --- Core Logic ---
+# def calculate_green_time(vehicle_count, has_emergency=False):
+#     if has_emergency:
+#         return EMERGENCY_GREEN_TIME
+    
+#     base_time = 10
+#     time_per_vehicle = 2
+#     max_time = 60
+#     return min(base_time + vehicle_count * time_per_vehicle, max_time)
+
+# def check_emergency_priority():
+#     """Check if emergency priority should be activated or deactivated"""
+#     global emergency_status
+    
+#     current_time = time.time()
+    
+#     # Check if we're in cooldown period
+#     if current_time < emergency_status['cooldown_end_time']:
+#         return
+    
+#     # Check if emergency priority is already active
+#     if emergency_status['active_emergency']:
+#         if current_time >= emergency_status['priority_end_time']:
+#             # Emergency priority period ended
+#             with lock:
+#                 emergency_status['active_emergency'] = False
+#                 emergency_status['emergency_lane'] = None
+#                 emergency_status['cooldown_end_time'] = current_time + PRIORITY_COOLDOWN
+#             print(f"[EMERGENCY] Priority mode ended. Cooldown until {time.strftime('%H:%M:%S', time.localtime(emergency_status['cooldown_end_time']))}")
+#         return
+    
+#     # Check for new emergency vehicles
+#     emergency_lane = None
+#     max_emergency_count = 0
+    
+#     with lock:
+#         for lane_id in LANE_IDS:
+#             if traffic_data[lane_id]['emergency_count'] >= EMERGENCY_PRIORITY_THRESHOLD:
+#                 if traffic_data[lane_id]['emergency_count'] > max_emergency_count:
+#                     max_emergency_count = traffic_data[lane_id]['emergency_count']
+#                     emergency_lane = lane_id
+    
+#     if emergency_lane is not None:
+#         # Activate emergency priority
+#         with lock:
+#             emergency_status['active_emergency'] = True
+#             emergency_status['emergency_lane'] = emergency_lane
+#             emergency_status['priority_end_time'] = current_time + EMERGENCY_GREEN_TIME
+#         print(f"[EMERGENCY] Priority activated for Lane {emergency_lane}! Green time: {EMERGENCY_GREEN_TIME}s")
+
+# def process_video_for_lane(lane_id):
+#     video_path = VIDEO_SOURCES[lane_id]
+#     cap = cv2.VideoCapture(video_path)
+
+#     if not cap.isOpened():
+#         print(f"[ERROR] Could not open video for lane {lane_id}: {video_path}")
+#         return
+
+#     print(f"[INFO] Started processing for lane {lane_id}...")
+
+#     while True:
+#         ok, frame = cap.read()
+#         if not ok:
+#             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+#             continue
+
+#         # --- YOLO Inference (thread-safe) ---
+#         with yolo_lock:
+#             results = MODEL.track(frame, persist=True, verbose=False,
+#                                   classes=VEHICLE_CLASSES + EMERGENCY_CLASSES)
+
+#         current_counts = defaultdict(int)
+#         emergency_count = 0
+
+#         if results and results[0].boxes.id is not None:
+#             boxes = results[0].boxes.xyxy.cpu().numpy()
+#             class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+#             confidences = results[0].boxes.conf.cpu().numpy()
+
+#             for box, cid, conf in zip(boxes, class_ids, confidences):
+#                 label = CLASS_NAMES[cid]
+#                 current_counts[label] += 1
+                
+#                 # Check for emergency vehicles (customize this logic based on your needs)
+#                 if cid in EMERGENCY_CLASSES and conf > 0.6:
+#                     emergency_count += 1
+#                     # Draw emergency vehicle with red border
+#                     color = (0, 0, 255)  # Red for emergency
+#                     thickness = 3
+#                 else:
+#                     color = (0, 255, 0)  # Green for regular vehicles
+#                     thickness = 2
+                
+#                 x1, y1, x2, y2 = map(int, box)
+#                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+#                 cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 8),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+#         total = sum(current_counts.values())
+        
+#         # Check emergency status
+#         with lock:
+#             has_emergency = emergency_status['active_emergency'] and emergency_status['emergency_lane'] == lane_id
+        
+#         gtime = calculate_green_time(total, has_emergency)
+
+#         # Draw status information
+#         status_color = (0, 0, 255) if has_emergency else (255, 255, 255)
+#         status_text = "EMERGENCY PRIORITY" if has_emergency else "NORMAL"
+        
+#         cv2.putText(frame, f"Lane {lane_id} - {status_text}", (10, 30),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+        
+#         info = f"Total: {total} | Emergency: {emergency_count} | Green: {gtime}s"
+#         cv2.putText(frame, info, (10, 70),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+#         # Draw emergency indicator
+#         if emergency_count > 0:
+#             cv2.putText(frame, "🚑 EMERGENCY VEHICLE DETECTED", (10, 110),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+#         ret, buf = cv2.imencode(".jpg", frame)
+#         frame_bytes = buf.tobytes()
+
+#         # --- Update global data safely ---
+#         with lock:
+#             lane = traffic_data[lane_id]
+#             lane["current_counts"] = current_counts
+#             lane["emergency_count"] = emergency_count
+#             lane["total_count"] = total
+#             lane["green_time"] = gtime
+#             lane["latest_frame"] = frame_bytes
+#             lane["has_emergency"] = has_emergency
+
+#             now = time.time()
+#             last = lane["time_labels"][-1] if lane["time_labels"] else 0
+#             if now - last > 5:
+#                 lane["density_history"].append(total)
+#                 lane["timing_history"].append(gtime)
+#                 lane["time_labels"].append(now)
+#                 if len(lane["density_history"]) > 20:
+#                     lane["density_history"].pop(0)
+#                     lane["timing_history"].pop(0)
+#                     lane["time_labels"].pop(0)
+
+# # --- Emergency Monitoring Thread ---
+# def emergency_monitor():
+#     """Continuously monitor for emergency vehicles and manage priority"""
+#     while True:
+#         check_emergency_priority()
+#         time.sleep(1)  # Check every second
+
+# # --- Flask Routes ---
+# @app.route("/")
+# def index():
+#     return render_template("index.html", lanes=LANE_IDS)
+
+# def generate_video_stream(lane_id):
+#     while True:
+#         time.sleep(0.03)
+#         with lock:
+#             frame = traffic_data[lane_id]["latest_frame"]
+#         if frame is None:
+#             continue
+#         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+#                frame + b"\r\n")
+
+# @app.route("/video_feed/<int:lane_id>")
+# def video_feed(lane_id):
+#     if lane_id not in LANE_IDS:
+#         return "Invalid Lane ID", 404
+#     return Response(generate_video_stream(lane_id),
+#                     mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# @app.route("/traffic_data")
+# def get_traffic_data():
+#     with lock:
+#         payload = {
 #             'lanes': {},
-#             'current_green_lane': current_green_lane,
-#             'system_time': time.strftime("%H:%M:%S")
+#             'emergency_status': emergency_status.copy()
 #         }
         
-#         for lane_id in range(1, 5):
-#             data['lanes'][lane_id] = {
-#                 'counts': dict(lanes_data[lane_id]['current_counts']),
-#                 'total': lanes_data[lane_id]['total_count'],
-#                 'light': lanes_data[lane_id]['current_light'],
-#                 'green_time': lanes_data[lane_id]['green_time_remaining'],
-#                 'density_history': lanes_data[lane_id]['density_history'],
-#                 'timing_history': lanes_data[lane_id]['timing_history'],
-#                 'time_labels': lanes_data[lane_id]['time_labels']
-#             }
+#         # Convert timestamps to readable format
+#         emergency_status_readable = emergency_status.copy()
+#         emergency_status_readable['priority_end_time'] = time.strftime("%H:%M:%S", time.localtime(emergency_status['priority_end_time'])) if emergency_status['priority_end_time'] > 0 else "N/A"
+#         emergency_status_readable['cooldown_end_time'] = time.strftime("%H:%M:%S", time.localtime(emergency_status['cooldown_end_time'])) if emergency_status['cooldown_end_time'] > 0 else "N/A"
+#         payload['emergency_status'] = emergency_status_readable
+        
+#         for lid, data in traffic_data.items():
+#             d = {k: v for k, v in data.items() if k != "latest_frame"}
+#             d["time_labels"] = [time.strftime("%H:%M:%S", time.localtime(ts))
+#                                 for ts in d["time_labels"]]
+#             payload['lanes'][lid] = d
     
-#     return jsonify(data)
+#     return jsonify(payload)
 
-# # Start traffic light management thread
-# traffic_light_thread = threading.Thread(target=manage_traffic_lights, daemon=True)
-# traffic_light_thread.start()
+# @app.route("/emergency_override/<int:lane_id>", methods=["POST"])
+# def emergency_override(lane_id):
+#     """Manual emergency override endpoint"""
+#     if lane_id not in LANE_IDS:
+#         return jsonify({"error": "Invalid lane ID"}), 400
+    
+#     with lock:
+#         emergency_status['active_emergency'] = True
+#         emergency_status['emergency_lane'] = lane_id
+#         emergency_status['priority_end_time'] = time.time() + EMERGENCY_GREEN_TIME
+#         emergency_status['cooldown_end_time'] = 0
+    
+#     print(f"[MANUAL OVERRIDE] Emergency priority activated for Lane {lane_id}")
+#     return jsonify({
+#         "status": "success",
+#         "message": f"Emergency priority activated for Lane {lane_id}",
+#         "green_time": EMERGENCY_GREEN_TIME
+#     })
 
-# # Initialize first lane as green
-# with lock:
-#     lanes_data[1]['current_light'] = 'GREEN'
-#     lanes_data[1]['green_time_remaining'] = MIN_GREEN_TIME
-#     light_change_time = time.time()
+# @app.route("/clear_emergency", methods=["POST"])
+# def clear_emergency():
+#     """Clear emergency priority manually"""
+#     with lock:
+#         emergency_status['active_emergency'] = False
+#         emergency_status['emergency_lane'] = None
+#         emergency_status['cooldown_end_time'] = time.time() + PRIORITY_COOLDOWN
+    
+#     print("[MANUAL OVERRIDE] Emergency priority cleared")
+#     return jsonify({
+#         "status": "success",
+#         "message": "Emergency priority cleared"
+#     })
 
-# if __name__ == '__main__':
-#     app.run(debug=True, host='0.0.0.0', port=3001, threaded=True)
+# if __name__ == "__main__":
+#     # Start video processing threads
+#     for lid in LANE_IDS:
+#         t = threading.Thread(target=process_video_for_lane,
+#                              args=(lid,), daemon=True)
+#         t.start()
+    
+#     # Start emergency monitoring thread
+#     emergency_thread = threading.Thread(target=emergency_monitor, daemon=True)
+#     emergency_thread.start()
+    
+#     print("[SYSTEM] Traffic monitoring system started with emergency vehicle prioritization")
+#     print("[SYSTEM] Emergency classes being monitored:", [CLASS_NAMES[c] for c in EMERGENCY_CLASSES])
+    
+#     app.run(debug=False, host="0.0.0.0", port=3001, threaded=True)
 
 
 
 
 
 
-from flask import Flask, render_template, Response, jsonify, request, redirect, url_for
+
+
+
+
+
+
+
+
+# emergency -> 2
+# from flask import Flask, render_template, Response, jsonify
+# from ultralytics import YOLO
+# import cv2
+# import numpy as np
+# from collections import defaultdict, deque
+# import time
+# import threading
+# import copy
+
+# app = Flask(__name__)
+
+# # --- Configuration ---
+# MODEL = YOLO('yolov8n.pt')
+# VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+# EMERGENCY_CLASSES = [0]  # person (can be extended to specific emergency vehicle classes)
+# CLASS_NAMES = MODEL.names
+# LANE_IDS = [1, 2, 3, 4]
+# VIDEO_SOURCES = {
+#     1: 'videos/lane1.mp4',
+#     2: 'videos/lane2.mp4',
+#     3: 'videos/lane3.mp4',
+#     4: 'videos/lane4.mp4',
+# }
+
+# # --- Emergency Vehicle Detection Configuration ---
+# EMERGENCY_PRIORITY_THRESHOLD = 1
+# EMERGENCY_GREEN_TIME = 20
+# PRIORITY_COOLDOWN = 30
+
+# # --- Green Time Configuration ---
+# GREEN_TIME_AVERAGING_WINDOW = 10  # Number of samples to average for green time
+# MIN_GREEN_TIME = 10  # Minimum green time in seconds
+# MAX_GREEN_TIME = 60  # Maximum green time in seconds
+# BASE_GREEN_TIME = 10  # Base green time without vehicles
+# TIME_PER_VEHICLE = 2  # Additional seconds per vehicle
+# UPDATE_INTERVAL = 5   # Seconds between green time updates
+
+# # --- Global Data Structures & Threading Lock ---
+# traffic_data = {}
+# emergency_status = {
+#     'active_emergency': False,
+#     'emergency_lane': None,
+#     'priority_end_time': 0,
+#     'cooldown_end_time': 0
+# }
+# lock = threading.Lock()
+# yolo_lock = threading.Lock()
+
+# for lane_id in LANE_IDS:
+#     traffic_data[lane_id] = {
+#         'current_counts': defaultdict(int),
+#         'emergency_count': 0,
+#         'total_count': 0,
+#         'latest_frame': None,
+#         'green_time': BASE_GREEN_TIME,  # Start with base time
+#         'target_green_time': BASE_GREEN_TIME,  # Target time we're moving toward
+#         'current_green_time': BASE_GREEN_TIME,  # Currently displayed time
+#         'density_history': deque(maxlen=20),
+#         'timing_history': deque(maxlen=20),
+#         'time_labels': deque(maxlen=20),
+#         'vehicle_count_history': deque(maxlen=GREEN_TIME_AVERAGING_WINDOW),
+#         'has_emergency': False,
+#         'last_update_time': 0
+#     }
+
+# # --- Core Logic ---
+# def calculate_target_green_time(vehicle_count, has_emergency=False):
+#     """Calculate target green time based on vehicle count"""
+#     if has_emergency:
+#         return EMERGENCY_GREEN_TIME
+    
+#     calculated_time = BASE_GREEN_TIME + (vehicle_count * TIME_PER_VEHICLE)
+#     return max(MIN_GREEN_TIME, min(calculated_time, MAX_GREEN_TIME))
+
+# def smooth_green_time_transition(lane_id, current_time):
+#     """Smoothly transition between green time values"""
+#     with lock:
+#         lane_data = traffic_data[lane_id]
+        
+#         # Only update at specified intervals
+#         if current_time - lane_data['last_update_time'] < UPDATE_INTERVAL:
+#             return lane_data['current_green_time']
+        
+#         # Calculate new target based on average vehicle count
+#         if lane_data['vehicle_count_history']:
+#             avg_vehicles = sum(lane_data['vehicle_count_history']) / len(lane_data['vehicle_count_history'])
+#             new_target = calculate_target_green_time(avg_vehicles, lane_data['has_emergency'])
+#         else:
+#             new_target = calculate_target_green_time(lane_data['total_count'], lane_data['has_emergency'])
+        
+#         # Smooth transition (move 25% toward target each update)
+#         current_gt = lane_data['current_green_time']
+#         smoothed_gt = current_gt + 0.25 * (new_target - current_gt)
+        
+#         # Round to nearest integer and clamp
+#         smoothed_gt = round(smoothed_gt)
+#         smoothed_gt = max(MIN_GREEN_TIME, min(smoothed_gt, MAX_GREEN_TIME))
+        
+#         lane_data['target_green_time'] = new_target
+#         lane_data['current_green_time'] = smoothed_gt
+#         lane_data['last_update_time'] = current_time
+        
+#         return smoothed_gt
+
+# def check_emergency_priority():
+#     """Check if emergency priority should be activated or deactivated"""
+#     global emergency_status
+    
+#     current_time = time.time()
+    
+#     # Check if we're in cooldown period
+#     if current_time < emergency_status['cooldown_end_time']:
+#         return
+    
+#     # Check if emergency priority is already active
+#     if emergency_status['active_emergency']:
+#         if current_time >= emergency_status['priority_end_time']:
+#             # Emergency priority period ended
+#             with lock:
+#                 emergency_status['active_emergency'] = False
+#                 emergency_status['emergency_lane'] = None
+#                 emergency_status['cooldown_end_time'] = current_time + PRIORITY_COOLDOWN
+#             print(f"[EMERGENCY] Priority mode ended. Cooldown until {time.strftime('%H:%M:%S', time.localtime(emergency_status['cooldown_end_time']))}")
+#         return
+    
+#     # Check for new emergency vehicles
+#     emergency_lane = None
+#     max_emergency_count = 0
+    
+#     with lock:
+#         for lane_id in LANE_IDS:
+#             if traffic_data[lane_id]['emergency_count'] >= EMERGENCY_PRIORITY_THRESHOLD:
+#                 if traffic_data[lane_id]['emergency_count'] > max_emergency_count:
+#                     max_emergency_count = traffic_data[lane_id]['emergency_count']
+#                     emergency_lane = lane_id
+    
+#     if emergency_lane is not None:
+#         # Activate emergency priority
+#         with lock:
+#             emergency_status['active_emergency'] = True
+#             emergency_status['emergency_lane'] = emergency_lane
+#             emergency_status['priority_end_time'] = current_time + EMERGENCY_GREEN_TIME
+#         print(f"[EMERGENCY] Priority activated for Lane {emergency_lane}! Green time: {EMERGENCY_GREEN_TIME}s")
+
+# def process_video_for_lane(lane_id):
+#     video_path = VIDEO_SOURCES[lane_id]
+#     cap = cv2.VideoCapture(video_path)
+
+#     if not cap.isOpened():
+#         print(f"[ERROR] Could not open video for lane {lane_id}: {video_path}")
+#         return
+
+#     print(f"[INFO] Started processing for lane {lane_id}...")
+
+#     while True:
+#         ok, frame = cap.read()
+#         if not ok:
+#             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+#             continue
+
+#         # --- YOLO Inference (thread-safe) ---
+#         with yolo_lock:
+#             results = MODEL.track(frame, persist=True, verbose=False,
+#                                   classes=VEHICLE_CLASSES + EMERGENCY_CLASSES)
+
+#         current_counts = defaultdict(int)
+#         emergency_count = 0
+#         current_time = time.time()
+
+#         if results and results[0].boxes.id is not None:
+#             boxes = results[0].boxes.xyxy.cpu().numpy()
+#             class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+#             confidences = results[0].boxes.conf.cpu().numpy()
+
+#             for box, cid, conf in zip(boxes, class_ids, confidences):
+#                 label = CLASS_NAMES[cid]
+#                 current_counts[label] += 1
+                
+#                 # Check for emergency vehicles
+#                 if cid in EMERGENCY_CLASSES and conf > 0.6:
+#                     emergency_count += 1
+#                     color = (0, 0, 255)  # Red for emergency
+#                     thickness = 3
+#                 else:
+#                     color = (0, 255, 0)  # Green for regular vehicles
+#                     thickness = 2
+                
+#                 x1, y1, x2, y2 = map(int, box)
+#                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+#                 cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 8),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+#         total = sum(current_counts.values())
+        
+#         # Check emergency status and calculate smoothed green time
+#         with lock:
+#             has_emergency = emergency_status['active_emergency'] and emergency_status['emergency_lane'] == lane_id
+#             traffic_data[lane_id]['has_emergency'] = has_emergency
+            
+#             # Add to vehicle count history for averaging
+#             traffic_data[lane_id]['vehicle_count_history'].append(total)
+        
+#         # Get smoothed green time
+#         smoothed_gtime = smooth_green_time_transition(lane_id, current_time)
+
+#         # Draw status information
+#         status_color = (0, 0, 255) if has_emergency else (255, 255, 255)
+#         status_text = "EMERGENCY PRIORITY" if has_emergency else "NORMAL"
+        
+#         cv2.putText(frame, f"Lane {lane_id} - {status_text}", (10, 30),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+        
+#         info = f"Total: {total} | Emergency: {emergency_count} | Green: {smoothed_gtime}s"
+#         cv2.putText(frame, info, (10, 70),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+#         # Draw emergency indicator
+#         if emergency_count > 0:
+#             cv2.putText(frame, "🚑 EMERGENCY VEHICLE DETECTED", (10, 110),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+#         ret, buf = cv2.imencode(".jpg", frame)
+#         frame_bytes = buf.tobytes()
+
+#         # --- Update global data safely ---
+#         with lock:
+#             lane = traffic_data[lane_id]
+#             lane["current_counts"] = current_counts
+#             lane["emergency_count"] = emergency_count
+#             lane["total_count"] = total
+#             lane["green_time"] = smoothed_gtime  # Use smoothed value
+
+#             now = time.time()
+#             last = lane["time_labels"][-1] if lane["time_labels"] else 0
+#             if now - last > 5:
+#                 lane["density_history"].append(total)
+#                 lane["timing_history"].append(smoothed_gtime)
+#                 lane["time_labels"].append(now)
+            
+#             lane["latest_frame"] = frame_bytes
+
+# # --- Emergency Monitoring Thread ---
+# def emergency_monitor():
+#     """Continuously monitor for emergency vehicles and manage priority"""
+#     while True:
+#         check_emergency_priority()
+#         time.sleep(1)
+
+# # --- Flask Routes ---
+# @app.route("/")
+# def index():
+#     return render_template("index.html", lanes=LANE_IDS)
+
+# def generate_video_stream(lane_id):
+#     while True:
+#         time.sleep(0.03)
+#         with lock:
+#             frame = traffic_data[lane_id]["latest_frame"]
+#         if frame is None:
+#             continue
+#         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+#                frame + b"\r\n")
+
+# @app.route("/video_feed/<int:lane_id>")
+# def video_feed(lane_id):
+#     if lane_id not in LANE_IDS:
+#         return "Invalid Lane ID", 404
+#     return Response(generate_video_stream(lane_id),
+#                     mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# @app.route("/traffic_data")
+# def get_traffic_data():
+#     with lock:
+#         payload = {
+#             'lanes': {},
+#             'emergency_status': emergency_status.copy()
+#         }
+        
+#         # Convert timestamps to readable format
+#         emergency_status_readable = emergency_status.copy()
+#         emergency_status_readable['priority_end_time'] = time.strftime("%H:%M:%S", time.localtime(emergency_status['priority_end_time'])) if emergency_status['priority_end_time'] > 0 else "N/A"
+#         emergency_status_readable['cooldown_end_time'] = time.strftime("%H:%M:%S", time.localtime(emergency_status['cooldown_end_time'])) if emergency_status['cooldown_end_time'] > 0 else "N/A"
+#         payload['emergency_status'] = emergency_status_readable
+        
+#         for lid, data in traffic_data.items():
+#             d = {k: v for k, v in data.items() if k != "latest_frame"}
+#             # Convert deques to lists for JSON serialization
+#             d["density_history"] = list(d["density_history"])
+#             d["timing_history"] = list(d["timing_history"])
+#             d["time_labels"] = [time.strftime("%H:%M:%S", time.localtime(ts)) for ts in d["time_labels"]]
+#             d["vehicle_count_history"] = list(d["vehicle_count_history"])
+#             payload['lanes'][lid] = d
+    
+#     return jsonify(payload)
+
+# @app.route("/emergency_override/<int:lane_id>", methods=["POST"])
+# def emergency_override(lane_id):
+#     """Manual emergency override endpoint"""
+#     if lane_id not in LANE_IDS:
+#         return jsonify({"error": "Invalid lane ID"}), 400
+    
+#     with lock:
+#         emergency_status['active_emergency'] = True
+#         emergency_status['emergency_lane'] = lane_id
+#         emergency_status['priority_end_time'] = time.time() + EMERGENCY_GREEN_TIME
+#         emergency_status['cooldown_end_time'] = 0
+        
+#         # Immediately update the green time for the emergency lane
+#         traffic_data[lane_id]['current_green_time'] = EMERGENCY_GREEN_TIME
+#         traffic_data[lane_id]['target_green_time'] = EMERGENCY_GREEN_TIME
+    
+#     print(f"[MANUAL OVERRIDE] Emergency priority activated for Lane {lane_id}")
+#     return jsonify({
+#         "status": "success",
+#         "message": f"Emergency priority activated for Lane {lane_id}",
+#         "green_time": EMERGENCY_GREEN_TIME
+#     })
+
+# @app.route("/clear_emergency", methods=["POST"])
+# def clear_emergency():
+#     """Clear emergency priority manually"""
+#     with lock:
+#         emergency_status['active_emergency'] = False
+#         emergency_status['emergency_lane'] = None
+#         emergency_status['cooldown_end_time'] = time.time() + PRIORITY_COOLDOWN
+    
+#     print("[MANUAL OVERRIDE] Emergency priority cleared")
+#     return jsonify({
+#         "status": "success",
+#         "message": "Emergency priority cleared"
+#     })
+
+# if __name__ == "__main__":
+#     # Start video processing threads
+#     for lid in LANE_IDS:
+#         t = threading.Thread(target=process_video_for_lane,
+#                              args=(lid,), daemon=True)
+#         t.start()
+    
+#     # Start emergency monitoring thread
+#     emergency_thread = threading.Thread(target=emergency_monitor, daemon=True)
+#     emergency_thread.start()
+    
+#     print("[SYSTEM] Traffic monitoring system started with smoothed green time calculations")
+#     print("[SYSTEM] Emergency classes being monitored:", [CLASS_NAMES[c] for c in EMERGENCY_CLASSES])
+#     print(f"[SYSTEM] Green time parameters: Base={BASE_GREEN_TIME}s, Min={MIN_GREEN_TIME}s, Max={MAX_GREEN_TIME}s")
+#     print(f"[SYSTEM] Averaging window: {GREEN_TIME_AVERAGING_WINDOW} samples, Update interval: {UPDATE_INTERVAL}s")
+    
+#     app.run(debug=False, host="0.0.0.0", port=3001, threaded=True)
+
+
+
+
+
+
+
+
+
+
+
+
+# combined
+# from flask import Flask, render_template, Response, jsonify, request
+# from werkzeug.utils import secure_filename
+# from ultralytics import YOLO
+# import cv2
+# import numpy as np
+# from collections import defaultdict, deque
+# import time
+# import threading
+# import copy
+# import os
+
+# app = Flask(__name__)
+
+# # --- Configuration ---
+# MODEL = YOLO('yolov8n.pt')
+# VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+# EMERGENCY_CLASSES = [0]  # person (can be extended to specific emergency vehicle classes)
+# CLASS_NAMES = MODEL.names
+# LANE_IDS = [1, 2, 3, 4]
+# UPLOAD_FOLDER = 'uploads'
+# os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# # --- Emergency Vehicle Detection Configuration ---
+# EMERGENCY_PRIORITY_THRESHOLD = 1
+# EMERGENCY_GREEN_TIME = 20
+# PRIORITY_COOLDOWN = 30
+
+# # --- Green Time Configuration ---
+# GREEN_TIME_AVERAGING_WINDOW = 10  # Number of samples to average for green time
+# MIN_GREEN_TIME = 10  # Minimum green time in seconds
+# MAX_GREEN_TIME = 60  # Maximum green time in seconds
+# BASE_GREEN_TIME = 10  # Base green time without vehicles
+# TIME_PER_VEHICLE = 2  # Additional seconds per vehicle
+# UPDATE_INTERVAL = 5   # Seconds between green time updates
+
+# # --- Global Data Structures & Threading Lock ---
+# traffic_data = {}
+# emergency_status = {
+#     'active_emergency': False,
+#     'emergency_lane': None,
+#     'priority_end_time': 0,
+#     'cooldown_end_time': 0
+# }
+# lock = threading.Lock()
+# yolo_lock = threading.Lock()
+# video_sources = {}
+
+# for lane_id in LANE_IDS:
+#     traffic_data[lane_id] = {
+#         'current_counts': defaultdict(int),
+#         'emergency_count': 0,
+#         'total_count': 0,
+#         'latest_frame': None,
+#         'green_time': BASE_GREEN_TIME,  # Start with base time
+#         'target_green_time': BASE_GREEN_TIME,  # Target time we're moving toward
+#         'current_green_time': BASE_GREEN_TIME,  # Currently displayed time
+#         'density_history': deque(maxlen=20),
+#         'timing_history': deque(maxlen=20),
+#         'time_labels': deque(maxlen=20),
+#         'vehicle_count_history': deque(maxlen=GREEN_TIME_AVERAGING_WINDOW),
+#         'has_emergency': False,
+#         'last_update_time': 0
+#     }
+
+# # --- Core Logic ---
+# def calculate_target_green_time(vehicle_count, has_emergency=False):
+#     """Calculate target green time based on vehicle count"""
+#     if has_emergency:
+#         return EMERGENCY_GREEN_TIME
+    
+#     calculated_time = BASE_GREEN_TIME + (vehicle_count * TIME_PER_VEHICLE)
+#     return max(MIN_GREEN_TIME, min(calculated_time, MAX_GREEN_TIME))
+
+# def smooth_green_time_transition(lane_id, current_time):
+#     """Smoothly transition between green time values"""
+#     with lock:
+#         lane_data = traffic_data[lane_id]
+        
+#         if current_time - lane_data['last_update_time'] < UPDATE_INTERVAL:
+#             return lane_data['current_green_time']
+        
+#         if lane_data['vehicle_count_history']:
+#             avg_vehicles = sum(lane_data['vehicle_count_history']) / len(lane_data['vehicle_count_history'])
+#             new_target = calculate_target_green_time(avg_vehicles, lane_data['has_emergency'])
+#         else:
+#             new_target = calculate_target_green_time(lane_data['total_count'], lane_data['has_emergency'])
+        
+#         current_gt = lane_data['current_green_time']
+#         smoothed_gt = current_gt + 0.25 * (new_target - current_gt)
+        
+#         smoothed_gt = round(smoothed_gt)
+#         smoothed_gt = max(MIN_GREEN_TIME, min(smoothed_gt, MAX_GREEN_TIME))
+        
+#         lane_data['target_green_time'] = new_target
+#         lane_data['current_green_time'] = smoothed_gt
+#         lane_data['last_update_time'] = current_time
+        
+#         return smoothed_gt
+
+# def check_emergency_priority():
+#     """Check if emergency priority should be activated or deactivated"""
+#     global emergency_status
+    
+#     current_time = time.time()
+    
+#     if current_time < emergency_status['cooldown_end_time']:
+#         return
+    
+#     if emergency_status['active_emergency']:
+#         if current_time >= emergency_status['priority_end_time']:
+#             with lock:
+#                 emergency_status['active_emergency'] = False
+#                 emergency_status['emergency_lane'] = None
+#                 emergency_status['cooldown_end_time'] = current_time + PRIORITY_COOLDOWN
+#             print(f"[EMERGENCY] Priority mode ended. Cooldown until {time.strftime('%H:%M:%S', time.localtime(emergency_status['cooldown_end_time']))}")
+#         return
+    
+#     emergency_lane = None
+#     max_emergency_count = 0
+    
+#     with lock:
+#         for lane_id in LANE_IDS:
+#             if traffic_data[lane_id]['emergency_count'] >= EMERGENCY_PRIORITY_THRESHOLD:
+#                 if traffic_data[lane_id]['emergency_count'] > max_emergency_count:
+#                     max_emergency_count = traffic_data[lane_id]['emergency_count']
+#                     emergency_lane = lane_id
+    
+#     if emergency_lane is not None:
+#         with lock:
+#             emergency_status['active_emergency'] = True
+#             emergency_status['emergency_lane'] = emergency_lane
+#             emergency_status['priority_end_time'] = current_time + EMERGENCY_GREEN_TIME
+#         print(f"[EMERGENCY] Priority activated for Lane {emergency_lane}! Green time: {EMERGENCY_GREEN_TIME}s")
+
+# def process_video_for_lane(lane_id, video_path):
+#     cap = cv2.VideoCapture(video_path)
+
+#     if not cap.isOpened():
+#         print(f"[ERROR] Could not open video for lane {lane_id}: {video_path}")
+#         return
+
+#     print(f"[INFO] Started processing for lane {lane_id}...")
+
+#     while True:
+#         ok, frame = cap.read()
+#         if not ok:
+#             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+#             continue
+
+#         with yolo_lock:
+#             results = MODEL.track(frame, persist=True, verbose=False,
+#                                   classes=VEHICLE_CLASSES + EMERGENCY_CLASSES)
+
+#         current_counts = defaultdict(int)
+#         emergency_count = 0
+#         current_time = time.time()
+
+#         if results and results[0].boxes.id is not None:
+#             boxes = results[0].boxes.xyxy.cpu().numpy()
+#             class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+#             confidences = results[0].boxes.conf.cpu().numpy()
+
+#             for box, cid, conf in zip(boxes, class_ids, confidences):
+#                 label = CLASS_NAMES[cid]
+#                 current_counts[label] += 1
+                
+#                 if cid in EMERGENCY_CLASSES and conf > 0.6:
+#                     emergency_count += 1
+#                     color = (0, 0, 255)
+#                     thickness = 3
+#                 else:
+#                     color = (0, 255, 0)
+#                     thickness = 2
+                
+#                 x1, y1, x2, y2 = map(int, box)
+#                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+#                 cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 8),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+#         total = sum(current_counts.values())
+        
+#         with lock:
+#             has_emergency = emergency_status['active_emergency'] and emergency_status['emergency_lane'] == lane_id
+#             traffic_data[lane_id]['has_emergency'] = has_emergency
+            
+#             traffic_data[lane_id]['vehicle_count_history'].append(total)
+        
+#         smoothed_gtime = smooth_green_time_transition(lane_id, current_time)
+
+#         status_color = (0, 0, 255) if has_emergency else (255, 255, 255)
+#         status_text = "EMERGENCY PRIORITY" if has_emergency else "NORMAL"
+        
+#         cv2.putText(frame, f"Lane {lane_id} - {status_text}", (10, 30),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+        
+#         info = f"Total: {total} | Emergency: {emergency_count} | Green: {smoothed_gtime}s"
+#         cv2.putText(frame, info, (10, 70),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+#         if emergency_count > 0:
+#             cv2.putText(frame, "🚑 EMERGENCY VEHICLE DETECTED", (10, 110),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+#         ret, buf = cv2.imencode(".jpg", frame)
+#         frame_bytes = buf.tobytes()
+
+#         with lock:
+#             lane = traffic_data[lane_id]
+#             lane["current_counts"] = current_counts
+#             lane["emergency_count"] = emergency_count
+#             lane["total_count"] = total
+#             lane["green_time"] = smoothed_gtime
+#             now = time.time()
+#             last = lane["time_labels"][-1] if lane["time_labels"] else 0
+#             if now - last > 5:
+#                 lane["density_history"].append(total)
+#                 lane["timing_history"].append(smoothed_gtime)
+#                 lane["time_labels"].append(now)
+            
+#             lane["latest_frame"] = frame_bytes
+
+# # --- Emergency Monitoring Thread ---
+# def emergency_monitor():
+#     """Continuously monitor for emergency vehicles and manage priority"""
+#     while True:
+#         check_emergency_priority()
+#         time.sleep(1)
+
+# # --- Flask Routes ---
+# @app.route("/")
+# def index():
+#     return render_template("index.html", lanes=LANE_IDS)
+
+# @app.route("/upload_and_process", methods=["POST"])
+# def upload_and_process():
+#     global video_sources
+#     uploaded_files = request.files.to_dict()
+#     if not uploaded_files:
+#         return jsonify({"error": "No files uploaded"}), 400
+
+#     video_sources = {}
+#     for lane_name, file_storage in uploaded_files.items():
+#         if file_storage.filename != '':
+#             lane_id = int(lane_name.replace('lane', ''))
+#             filename = secure_filename(file_storage.filename)
+#             filepath = os.path.join(UPLOAD_FOLDER, filename)
+#             file_storage.save(filepath)
+#             video_sources[lane_id] = filepath
+
+#     if not video_sources:
+#         return jsonify({"error": "No video files provided"}), 400
+
+#     for lid in video_sources.keys():
+#         t = threading.Thread(target=process_video_for_lane,
+#                              args=(lid, video_sources[lid]), daemon=True)
+#         t.start()
+
+#     emergency_thread = threading.Thread(target=emergency_monitor, daemon=True)
+#     emergency_thread.start()
+
+#     print("[SYSTEM] Traffic monitoring system started with uploaded videos")
+#     print("[SYSTEM] Emergency classes being monitored:", [CLASS_NAMES[c] for c in EMERGENCY_CLASSES])
+    
+#     return jsonify({
+#         "status": "success",
+#         "message": "Videos uploaded and processing started.",
+#         "processed_lanes": list(video_sources.keys())
+#     })
+
+# def generate_video_stream(lane_id):
+#     while True:
+#         time.sleep(0.03)
+#         with lock:
+#             frame = traffic_data[lane_id]["latest_frame"]
+#         if frame is None:
+#             continue
+#         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+#                frame + b"\r\n")
+
+# @app.route("/video_feed/<int:lane_id>")
+# def video_feed(lane_id):
+#     if lane_id not in LANE_IDS:
+#         return "Invalid Lane ID", 404
+#     return Response(generate_video_stream(lane_id),
+#                     mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# @app.route("/traffic_data")
+# def get_traffic_data():
+#     with lock:
+#         payload = {
+#             'lanes': {},
+#             'emergency_status': emergency_status.copy()
+#         }
+        
+#         emergency_status_readable = emergency_status.copy()
+#         emergency_status_readable['priority_end_time'] = time.strftime("%H:%M:%S", time.localtime(emergency_status['priority_end_time'])) if emergency_status['priority_end_time'] > 0 else "N/A"
+#         emergency_status_readable['cooldown_end_time'] = time.strftime("%H:%M:%S", time.localtime(emergency_status['cooldown_end_time'])) if emergency_status['cooldown_end_time'] > 0 else "N/A"
+#         payload['emergency_status'] = emergency_status_readable
+        
+#         for lid, data in traffic_data.items():
+#             d = {k: v for k, v in data.items() if k != "latest_frame"}
+#             d["density_history"] = list(d["density_history"])
+#             d["timing_history"] = list(d["timing_history"])
+#             d["time_labels"] = [time.strftime("%H:%M:%S", time.localtime(ts)) for ts in d["time_labels"]]
+#             d["vehicle_count_history"] = list(d["vehicle_count_history"])
+#             payload['lanes'][lid] = d
+    
+#     return jsonify(payload)
+
+# @app.route("/emergency_override/<int:lane_id>", methods=["POST"])
+# def emergency_override(lane_id):
+#     """Manual emergency override endpoint"""
+#     if lane_id not in LANE_IDS:
+#         return jsonify({"error": "Invalid lane ID"}), 400
+    
+#     with lock:
+#         emergency_status['active_emergency'] = True
+#         emergency_status['emergency_lane'] = lane_id
+#         emergency_status['priority_end_time'] = time.time() + EMERGENCY_GREEN_TIME
+#         emergency_status['cooldown_end_time'] = 0
+        
+#         traffic_data[lane_id]['current_green_time'] = EMERGENCY_GREEN_TIME
+#         traffic_data[lane_id]['target_green_time'] = EMERGENCY_GREEN_TIME
+    
+#     print(f"[MANUAL OVERRIDE] Emergency priority activated for Lane {lane_id}")
+#     return jsonify({
+#         "status": "success",
+#         "message": f"Emergency priority activated for Lane {lane_id}",
+#         "green_time": EMERGENCY_GREEN_TIME
+#     })
+
+# @app.route("/clear_emergency", methods=["POST"])
+# def clear_emergency():
+#     """Clear emergency priority manually"""
+#     with lock:
+#         emergency_status['active_emergency'] = False
+#         emergency_status['emergency_lane'] = None
+#         emergency_status['cooldown_end_time'] = time.time() + PRIORITY_COOLDOWN
+    
+#     print("[MANUAL OVERRIDE] Emergency priority cleared")
+#     return jsonify({
+#         "status": "success",
+#         "message": "Emergency priority cleared"
+#     })
+
+# if __name__ == "__main__":
+#     app.run(debug=False, host="0.0.0.0", port=3001, threaded=True)
+
+
+
+
+
+
+
+
+
+
+#  accident prevention -> a little bit incorrect
+# from flask import Flask, render_template, Response, jsonify, request
+# from werkzeug.utils import secure_filename
+# from ultralytics import YOLO
+# import cv2
+# import numpy as np
+# from collections import defaultdict, deque
+# import time
+# import threading
+# import copy
+# import os
+
+# app = Flask(__name__)
+
+# # --- Configuration ---
+# MODEL = YOLO('yolov8n.pt')
+# VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+# EMERGENCY_CLASSES = [0]  # person (can be extended to specific emergency vehicle classes)
+# CLASS_NAMES = MODEL.names
+# LANE_IDS = [1, 2, 3, 4]
+# UPLOAD_FOLDER = 'uploads'
+# os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# # --- Emergency Vehicle Detection Configuration ---
+# EMERGENCY_PRIORITY_THRESHOLD = 1
+# EMERGENCY_GREEN_TIME = 20
+# PRIORITY_COOLDOWN = 30
+
+# # --- Green Time Configuration ---
+# GREEN_TIME_AVERAGING_WINDOW = 10  # Number of samples to average for green time
+# MIN_GREEN_TIME = 10  # Minimum green time in seconds
+# MAX_GREEN_TIME = 60  # Maximum green time in seconds
+# BASE_GREEN_TIME = 10  # Base green time without vehicles
+# TIME_PER_VEHICLE = 2  # Additional seconds per vehicle
+# UPDATE_INTERVAL = 5   # Seconds between green time updates
+
+# # --- Global Data Structures & Threading Lock ---
+# traffic_data = {}
+# system_status = {
+#     'priority_mode': 'normal', # 'normal', 'emergency', 'accident'
+#     'active_lane': None,
+#     'priority_end_time': 0,
+#     'cooldown_end_time': 0
+# }
+# lock = threading.Lock()
+# yolo_lock = threading.Lock()
+# video_sources = {}
+
+# for lane_id in LANE_IDS:
+#     traffic_data[lane_id] = {
+#         'current_counts': defaultdict(int),
+#         'emergency_count': 0,
+#         'total_count': 0,
+#         'latest_frame': None,
+#         'green_time': BASE_GREEN_TIME,
+#         'target_green_time': BASE_GREEN_TIME,
+#         'current_green_time': BASE_GREEN_TIME,
+#         'density_history': deque(maxlen=20),
+#         'timing_history': deque(maxlen=20),
+#         'time_labels': deque(maxlen=20),
+#         'vehicle_count_history': deque(maxlen=GREEN_TIME_AVERAGING_WINDOW),
+#         'has_emergency': False,
+#         'last_update_time': 0,
+#         'tracked_objects': {},
+#         'accident_detected': False,
+#         'accident_location': None
+#     }
+
+# # --- Core Logic ---
+# def calculate_target_green_time(vehicle_count, has_emergency=False):
+#     """Calculate target green time based on vehicle count"""
+#     if has_emergency:
+#         return EMERGENCY_GREEN_TIME
+    
+#     calculated_time = BASE_GREEN_TIME + (vehicle_count * TIME_PER_VEHICLE)
+#     return max(MIN_GREEN_TIME, min(calculated_time, MAX_GREEN_TIME))
+
+# def smooth_green_time_transition(lane_id, current_time):
+#     """Smoothly transition between green time values"""
+#     with lock:
+#         lane_data = traffic_data[lane_id]
+        
+#         if current_time - lane_data['last_update_time'] < UPDATE_INTERVAL:
+#             return lane_data['current_green_time']
+        
+#         if lane_data['vehicle_count_history']:
+#             avg_vehicles = sum(lane_data['vehicle_count_history']) / len(lane_data['vehicle_count_history'])
+#             new_target = calculate_target_green_time(avg_vehicles, lane_data['has_emergency'])
+#         else:
+#             new_target = calculate_target_green_time(lane_data['total_count'], lane_data['has_emergency'])
+        
+#         current_gt = lane_data['current_green_time']
+#         smoothed_gt = current_gt + 0.25 * (new_target - current_gt)
+        
+#         smoothed_gt = round(smoothed_gt)
+#         smoothed_gt = max(MIN_GREEN_TIME, min(smoothed_gt, MAX_GREEN_TIME))
+        
+#         lane_data['target_green_time'] = new_target
+#         lane_data['current_green_time'] = smoothed_gt
+#         lane_data['last_update_time'] = current_time
+        
+#         return smoothed_gt
+
+# def check_overlap(box1, box2):
+#     """Simple check for bounding box overlap."""
+#     x1, y1, x2, y2 = box1
+#     x3, y3, x4, y4 = box2
+    
+#     return not (x2 < x3 or x4 < x1 or y2 < y3 or y4 < y1)
+
+# def manage_priorities():
+#     """Check for emergency/accident and manage priority status"""
+#     global system_status
+    
+#     current_time = time.time()
+    
+#     if current_time < system_status['cooldown_end_time']:
+#         return
+    
+#     if system_status['priority_mode'] == 'accident':
+#         return # Accident mode requires manual reset
+    
+#     # Check if a previously active emergency has ended
+#     if system_status['priority_mode'] == 'emergency' and current_time >= system_status['priority_end_time']:
+#         with lock:
+#             system_status['priority_mode'] = 'normal'
+#             system_status['active_lane'] = None
+#             system_status['cooldown_end_time'] = current_time + PRIORITY_COOLDOWN
+#         print(f"[PRIORITY] Emergency mode ended. Cooldown until {time.strftime('%H:%M:%S', time.localtime(system_status['cooldown_end_time']))}")
+#         return
+
+#     # Check for new emergency
+#     emergency_lane = None
+#     max_emergency_count = 0
+#     with lock:
+#         for lane_id in LANE_IDS:
+#             if traffic_data[lane_id]['emergency_count'] >= EMERGENCY_PRIORITY_THRESHOLD:
+#                 if traffic_data[lane_id]['emergency_count'] > max_emergency_count:
+#                     max_emergency_count = traffic_data[lane_id]['emergency_count']
+#                     emergency_lane = lane_id
+    
+#     if emergency_lane is not None:
+#         with lock:
+#             system_status['priority_mode'] = 'emergency'
+#             system_status['active_lane'] = emergency_lane
+#             system_status['priority_end_time'] = current_time + EMERGENCY_GREEN_TIME
+#         print(f"[PRIORITY] Emergency activated for Lane {emergency_lane}! Green time: {EMERGENCY_GREEN_TIME}s")
+
+# def process_video_for_lane(lane_id, video_path):
+#     cap = cv2.VideoCapture(video_path)
+
+#     if not cap.isOpened():
+#         print(f"[ERROR] Could not open video for lane {lane_id}: {video_path}")
+#         return
+
+#     print(f"[INFO] Started processing for lane {lane_id}...")
+    
+#     prev_positions = defaultdict(lambda: deque(maxlen=5)) # For sudden stop detection
+
+#     while True:
+#         ok, frame = cap.read()
+#         if not ok:
+#             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+#             continue
+
+#         current_time = time.time()
+        
+#         with yolo_lock:
+#             results = MODEL.track(frame, persist=True, verbose=False,
+#                                   classes=VEHICLE_CLASSES + EMERGENCY_CLASSES)
+
+#         current_counts = defaultdict(int)
+#         emergency_count = 0
+#         accident_detected = False
+#         accident_location = None
+#         current_tracked_ids = set()
+
+#         if results and results[0].boxes.id is not None:
+#             track_ids = results[0].boxes.id.cpu().numpy().astype(int)
+#             boxes = results[0].boxes.xyxy.cpu().numpy()
+#             class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+#             confidences = results[0].boxes.conf.cpu().numpy()
+
+#             for box, track_id, cid, conf in zip(boxes, track_ids, class_ids, confidences):
+#                 label = CLASS_NAMES[cid]
+#                 current_counts[label] += 1
+#                 current_tracked_ids.add(track_id)
+                
+#                 # Update tracked object history
+#                 x1, y1, x2, y2 = map(int, box)
+#                 center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
+                
+#                 # Check for emergency vehicle
+#                 if cid in EMERGENCY_CLASSES and conf > 0.6:
+#                     emergency_count += 1
+#                     color = (0, 0, 255)
+#                     thickness = 3
+#                 else:
+#                     color = (0, 255, 0)
+#                     thickness = 2
+                
+#                 # Check for sudden stop
+#                 prev_positions[track_id].append({'pos': (center_x, center_y), 'time': current_time})
+#                 if len(prev_positions[track_id]) >= 3:
+#                     p1 = prev_positions[track_id][-3]
+#                     p2 = prev_positions[track_id][-2]
+#                     p3 = prev_positions[track_id][-1]
+#                     dist_1_2 = np.sqrt((p2['pos'][0] - p1['pos'][0])**2 + (p2['pos'][1] - p1['pos'][1])**2)
+#                     dist_2_3 = np.sqrt((p3['pos'][0] - p2['pos'][0])**2 + (p3['pos'][1] - p2['pos'][1])**2)
+                    
+#                     if dist_1_2 > 20 and dist_2_3 < 5: # Was moving, now stopped
+#                         accident_detected = True
+#                         accident_location = (center_x, center_y)
+#                         break
+
+#                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+#                 cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 8),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+#             # Check for bounding box overlap (collision)
+#             if not accident_detected:
+#                 for i in range(len(boxes)):
+#                     for j in range(i + 1, len(boxes)):
+#                         if check_overlap(boxes[i], boxes[j]) and confidences[i] > 0.5 and confidences[j] > 0.5:
+#                             accident_detected = True
+#                             accident_location = ((boxes[i][0]+boxes[i][2])/2, (boxes[i][1]+boxes[i][3])/2)
+#                             break
+#                     if accident_detected:
+#                         break
+
+#         total = sum(current_counts.values())
+        
+#         with lock:
+#             has_emergency = system_status['priority_mode'] == 'emergency' and system_status['active_lane'] == lane_id
+            
+#             traffic_data[lane_id]['has_emergency'] = has_emergency
+#             traffic_data[lane_id]['vehicle_count_history'].append(total)
+#             traffic_data[lane_id]['accident_detected'] = accident_detected
+#             traffic_data[lane_id]['accident_location'] = accident_location
+            
+#             if accident_detected:
+#                 system_status['priority_mode'] = 'accident'
+#                 system_status['active_lane'] = lane_id
+
+#         smoothed_gtime = smooth_green_time_transition(lane_id, current_time)
+        
+#         if system_status['priority_mode'] == 'accident':
+#             status_text = "ACCIDENT DETECTED"
+#             status_color = (0, 0, 255)
+#             cv2.putText(frame, "❗ ACCIDENT DETECTED ❗", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+#             info = f"Lane {lane_id} - Accident Location: ({int(accident_location[0])},{int(accident_location[1])})" if accident_location else "N/A"
+#             cv2.putText(frame, info, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+#         else:
+#             status_color = (0, 0, 255) if has_emergency else (255, 255, 255)
+#             status_text = "EMERGENCY PRIORITY" if has_emergency else "NORMAL"
+#             cv2.putText(frame, f"Lane {lane_id} - {status_text}", (10, 30),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+            
+#             info = f"Total: {total} | Emergency: {emergency_count} | Green: {smoothed_gtime}s"
+#             cv2.putText(frame, info, (10, 70),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+#         if emergency_count > 0:
+#             cv2.putText(frame, "🚑 EMERGENCY VEHICLE DETECTED", (10, 110),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+#         ret, buf = cv2.imencode(".jpg", frame)
+#         frame_bytes = buf.tobytes()
+
+#         with lock:
+#             lane = traffic_data[lane_id]
+#             lane["current_counts"] = current_counts
+#             lane["emergency_count"] = emergency_count
+#             lane["total_count"] = total
+#             lane["green_time"] = smoothed_gtime
+#             now = time.time()
+#             last = lane["time_labels"][-1] if lane["time_labels"] else 0
+#             if now - last > 5:
+#                 lane["density_history"].append(total)
+#                 lane["timing_history"].append(smoothed_gtime)
+#                 lane["time_labels"].append(now)
+            
+#             lane["latest_frame"] = frame_bytes
+        
+# # --- Emergency/Accident Monitoring Thread ---
+# def priority_monitor():
+#     """Continuously monitor for emergency vehicles and accidents and manage priority"""
+#     while True:
+#         manage_priorities()
+#         time.sleep(1)
+
+# # --- Flask Routes ---
+# @app.route("/")
+# def index():
+#     return render_template("index.html", lanes=LANE_IDS)
+
+# @app.route("/upload_and_process", methods=["POST"])
+# def upload_and_process():
+#     global video_sources
+#     uploaded_files = request.files.to_dict()
+#     if not uploaded_files:
+#         return jsonify({"error": "No files uploaded"}), 400
+
+#     video_sources = {}
+#     for lane_name, file_storage in uploaded_files.items():
+#         if file_storage.filename != '':
+#             lane_id = int(lane_name.replace('lane', ''))
+#             filename = secure_filename(file_storage.filename)
+#             filepath = os.path.join(UPLOAD_FOLDER, filename)
+#             file_storage.save(filepath)
+#             video_sources[lane_id] = filepath
+
+#     if not video_sources:
+#         return jsonify({"error": "No video files provided"}), 400
+
+#     for lid in video_sources.keys():
+#         t = threading.Thread(target=process_video_for_lane,
+#                              args=(lid, video_sources[lid]), daemon=True)
+#         t.start()
+
+#     priority_thread = threading.Thread(target=priority_monitor, daemon=True)
+#     priority_thread.start()
+
+#     print("[SYSTEM] Traffic monitoring system started with uploaded videos")
+#     print("[SYSTEM] Emergency classes being monitored:", [CLASS_NAMES[c] for c in EMERGENCY_CLASSES])
+    
+#     return jsonify({
+#         "status": "success",
+#         "message": "Videos uploaded and processing started.",
+#         "processed_lanes": list(video_sources.keys())
+#     })
+
+# def generate_video_stream(lane_id):
+#     while True:
+#         time.sleep(0.03)
+#         with lock:
+#             frame = traffic_data[lane_id]["latest_frame"]
+#         if frame is None:
+#             continue
+#         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+#                frame + b"\r\n")
+
+# @app.route("/video_feed/<int:lane_id>")
+# def video_feed(lane_id):
+#     if lane_id not in LANE_IDS:
+#         return "Invalid Lane ID", 404
+#     return Response(generate_video_stream(lane_id),
+#                     mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# @app.route("/traffic_data")
+# def get_traffic_data():
+#     with lock:
+#         payload = {
+#             'lanes': {},
+#             'system_status': system_status.copy()
+#         }
+        
+#         system_status_readable = system_status.copy()
+#         system_status_readable['priority_end_time'] = time.strftime("%H:%M:%S", time.localtime(system_status['priority_end_time'])) if system_status['priority_end_time'] > 0 else "N/A"
+#         system_status_readable['cooldown_end_time'] = time.strftime("%H:%M:%S", time.localtime(system_status['cooldown_end_time'])) if system_status['cooldown_end_time'] > 0 else "N/A"
+#         payload['system_status'] = system_status_readable
+        
+#         for lid, data in traffic_data.items():
+#             d = {k: v for k, v in data.items() if k not in ["latest_frame", "tracked_objects"]}
+#             d["density_history"] = list(d["density_history"])
+#             d["timing_history"] = list(d["timing_history"])
+#             d["time_labels"] = [time.strftime("%H:%M:%S", time.localtime(ts)) for ts in d["time_labels"]]
+#             d["vehicle_count_history"] = list(d["vehicle_count_history"])
+#             payload['lanes'][lid] = d
+    
+#     return jsonify(payload)
+
+# @app.route("/emergency_override/<int:lane_id>", methods=["POST"])
+# def emergency_override(lane_id):
+#     """Manual emergency override endpoint"""
+#     if lane_id not in LANE_IDS:
+#         return jsonify({"error": "Invalid lane ID"}), 400
+    
+#     with lock:
+#         system_status['priority_mode'] = 'emergency'
+#         system_status['active_lane'] = lane_id
+#         system_status['priority_end_time'] = time.time() + EMERGENCY_GREEN_TIME
+#         system_status['cooldown_end_time'] = 0
+        
+#         traffic_data[lane_id]['current_green_time'] = EMERGENCY_GREEN_TIME
+#         traffic_data[lane_id]['target_green_time'] = EMERGENCY_GREEN_TIME
+    
+#     print(f"[MANUAL OVERRIDE] Emergency priority activated for Lane {lane_id}")
+#     return jsonify({
+#         "status": "success",
+#         "message": f"Emergency priority activated for Lane {lane_id}",
+#         "green_time": EMERGENCY_GREEN_TIME
+#     })
+
+# @app.route("/clear_emergency", methods=["POST"])
+# def clear_emergency():
+#     """Clear emergency priority manually"""
+#     with lock:
+#         system_status['priority_mode'] = 'normal'
+#         system_status['active_lane'] = None
+#         system_status['cooldown_end_time'] = time.time() + PRIORITY_COOLDOWN
+    
+#     print("[MANUAL OVERRIDE] Emergency priority cleared")
+#     return jsonify({
+#         "status": "success",
+#         "message": "Emergency priority cleared"
+#     })
+
+# @app.route("/clear_accident", methods=["POST"])
+# def clear_accident():
+#     """Manually clear an accident alert"""
+#     with lock:
+#         for lane_id in LANE_IDS:
+#             traffic_data[lane_id]['accident_detected'] = False
+#             traffic_data[lane_id]['accident_location'] = None
+#         system_status['priority_mode'] = 'normal'
+#         system_status['active_lane'] = None
+#         system_status['cooldown_end_time'] = time.time() + PRIORITY_COOLDOWN
+    
+#     print("[MANUAL OVERRIDE] Accident alert cleared")
+#     return jsonify({
+#         "status": "success",
+#         "message": "Accident alert cleared and system reset."
+#     })
+
+# if __name__ == "__main__":
+#     app.run(debug=False, host="0.0.0.0", port=3001, threaded=True)
+
+
+
+
+
+
+
+
+
+
+
+
+# accident prevention -> imporved version
+from flask import Flask, render_template, Response, jsonify, request
+from werkzeug.utils import secure_filename
 from ultralytics import YOLO
 import cv2
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, deque
 import time
 import threading
-import logging
-from logging.handlers import RotatingFileHandler
+import copy
 import os
-from datetime import datetime
 
 app = Flask(__name__)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('TrafficSystem')
-handler = RotatingFileHandler('traffic_system.log', maxBytes=1000000, backupCount=3)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-
-# Initialize YOLOv8 model with error handling
-try:
-    model = YOLO('yolov8n.pt')
-    logger.info("YOLOv8 model loaded successfully")
-except Exception as e:
-    logger.error(f"Failed to load YOLOv8 model: {e}")
-    # Fallback to a basic detection method if model fails to load
-    model = None
-
-# Define vehicle classes of interest (COCO Dataset Class IDs)
+# --- Configuration ---
+MODEL = YOLO('yolov8n.pt')
 VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
-class_names = model.names if model else {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+EMERGENCY_CLASSES = [0]  # person (can be extended to specific emergency vehicle classes)
+CLASS_NAMES = MODEL.names
+LANE_IDS = [1, 2, 3, 4]
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Traffic light states
-TRAFFIC_LIGHT_STATES = {
-    'RED': 0,
-    'YELLOW': 1, 
-    'GREEN': 2
+# --- Emergency Vehicle Detection Configuration ---
+EMERGENCY_PRIORITY_THRESHOLD = 1
+EMERGENCY_GREEN_TIME = 20
+PRIORITY_COOLDOWN = 30
+
+# --- Green Time Configuration ---
+GREEN_TIME_AVERAGING_WINDOW = 10  # Number of samples to average for green time
+MIN_GREEN_TIME = 10  # Minimum green time in seconds
+MAX_GREEN_TIME = 60  # Maximum green time in seconds
+BASE_GREEN_TIME = 10  # Base green time without vehicles
+TIME_PER_VEHICLE = 2  # Additional seconds per vehicle
+UPDATE_INTERVAL = 5   # Seconds between green time updates
+
+# --- Global Data Structures & Threading Lock ---
+traffic_data = {}
+system_status = {
+    'priority_mode': 'normal', # 'normal', 'emergency', 'accident'
+    'active_lane': None,
+    'priority_end_time': 0,
+    'cooldown_end_time': 0
 }
+lock = threading.Lock()
+yolo_lock = threading.Lock()
+video_sources = {}
 
-# Global data structure for all 4 lanes
-lanes_data = {}
-for lane_id in range(1, 5):
-    lanes_data[lane_id] = {
-        'current_counts': {'car': 0, 'bus': 0, 'truck': 0, 'motorcycle': 0},
+for lane_id in LANE_IDS:
+    traffic_data[lane_id] = {
+        'current_counts': defaultdict(int),
+        'emergency_count': 0,
         'total_count': 0,
-        'density_history': [],
-        'timing_history': [],
-        'time_labels': [],
-        'current_light': 'RED',
-        'green_time_remaining': 0,
-        'video_source': f'videos/lane{lane_id}.mp4',
-        'last_update': time.time(),
-        'status': 'active'
+        'latest_frame': None,
+        'green_time': BASE_GREEN_TIME,
+        'target_green_time': BASE_GREEN_TIME,
+        'current_green_time': BASE_GREEN_TIME,
+        'density_history': deque(maxlen=20),
+        'timing_history': deque(maxlen=20),
+        'time_labels': deque(maxlen=20),
+        'vehicle_count_history': deque(maxlen=GREEN_TIME_AVERAGING_WINDOW),
+        'has_emergency': False,
+        'last_update_time': 0,
+        'tracked_objects': {},
+        'accident_detected': False,
+        'accident_location': None
     }
 
-lock = threading.Lock()
-current_green_lane = 1
-light_change_time = time.time()
-YELLOW_LIGHT_DURATION = 3  # seconds
-MIN_GREEN_TIME = 10        # seconds
-MAX_GREEN_TIME = 60        # seconds
-emergency_mode = False
-system_start_time = time.time()
-
-def calculate_green_time(vehicle_count):
-    """Calculate green time based on vehicle count with min/max limits"""
-    time_per_vehicle = 2  # seconds per vehicle
-    calculated_time = MIN_GREEN_TIME + (vehicle_count * time_per_vehicle)
-    return min(calculated_time, MAX_GREEN_TIME)
-
-def manage_traffic_lights():
-    """Manage the traffic light cycle for all lanes"""
-    global current_green_lane, light_change_time, lanes_data, emergency_mode
+# --- Core Logic ---
+def calculate_target_green_time(vehicle_count, has_emergency=False):
+    """Calculate target green time based on vehicle count"""
+    if has_emergency:
+        return EMERGENCY_GREEN_TIME
     
-    while True:
-        with lock:
-            current_time = time.time()
-            elapsed = current_time - light_change_time
-            
-            # Emergency mode - all lights red except for emergency vehicle lane
-            if emergency_mode:
-                for lane_id in range(1, 5):
-                    lanes_data[lane_id]['current_light'] = 'RED'
-                # In a real system, we'd detect which lane has emergency vehicles
-                # For demo, we'll assume lane 1 has emergency vehicles
-                lanes_data[1]['current_light'] = 'GREEN'
-                lanes_data[1]['green_time_remaining'] = 999  # Indefinite green
-                time.sleep(1)
-                continue
-            
-            # Check if current green light time has expired
-            current_green_time = lanes_data[current_green_lane]['green_time_remaining']
-            
-            if elapsed >= current_green_time:
-                # Switch to next lane
-                next_lane = current_green_lane % 4 + 1
-                
-                # Set yellow light for current lane
-                lanes_data[current_green_lane]['current_light'] = 'YELLOW'
-                lanes_data[current_green_lane]['green_time_remaining'] = YELLOW_LIGHT_DURATION
-                
-                # After yellow duration, switch to green for next lane
-                time.sleep(YELLOW_LIGHT_DURATION)
-                
-                lanes_data[current_green_lane]['current_light'] = 'RED'
-                current_green_lane = next_lane
-                lanes_data[current_green_lane]['current_light'] = 'GREEN'
-                
-                # Calculate new green time based on current traffic
-                vehicle_count = lanes_data[current_green_lane]['total_count']
-                new_green_time = calculate_green_time(vehicle_count)
-                lanes_data[current_green_lane]['green_time_remaining'] = new_green_time
-                
-                light_change_time = time.time()
-                
-                logger.info(f"Switched to Lane {current_green_lane} with {new_green_time}s green time")
+    calculated_time = BASE_GREEN_TIME + (vehicle_count * TIME_PER_VEHICLE)
+    return max(MIN_GREEN_TIME, min(calculated_time, MAX_GREEN_TIME))
+
+def smooth_green_time_transition(lane_id, current_time):
+    """Smoothly transition between green time values"""
+    with lock:
+        lane_data = traffic_data[lane_id]
         
-        time.sleep(0.1)  # Small delay to prevent CPU overload
+        if current_time - lane_data['last_update_time'] < UPDATE_INTERVAL:
+            return lane_data['current_green_time']
+        
+        if lane_data['vehicle_count_history']:
+            avg_vehicles = sum(lane_data['vehicle_count_history']) / len(lane_data['vehicle_count_history'])
+            new_target = calculate_target_green_time(avg_vehicles, lane_data['has_emergency'])
+        else:
+            new_target = calculate_target_green_time(lane_data['total_count'], lane_data['has_emergency'])
+        
+        current_gt = lane_data['current_green_time']
+        smoothed_gt = current_gt + 0.25 * (new_target - current_gt)
+        
+        smoothed_gt = round(smoothed_gt)
+        smoothed_gt = max(MIN_GREEN_TIME, min(smoothed_gt, MAX_GREEN_TIME))
+        
+        lane_data['target_green_time'] = new_target
+        lane_data['current_green_time'] = smoothed_gt
+        lane_data['last_update_time'] = current_time
+        
+        return smoothed_gt
 
-def process_lane_video(lane_id):
-    """Process video for a specific lane and count vehicles"""
-    video_source = lanes_data[lane_id]['video_source']
+def check_overlap(box1, box2):
+    """Simple check for bounding box overlap."""
+    x1, y1, x2, y2 = box1
+    x3, y3, x4, y4 = box2
     
-    # Check if video file exists
-    if not os.path.exists(video_source):
-        logger.error(f"Video file not found: {video_source}")
-        lanes_data[lane_id]['status'] = 'error'
-        # Generate a placeholder frame with error message
-        while True:
-            frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(frame, f"Video not found: {video_source}", (50, 240), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            ret, buffer = cv2.imencode('.jpg', frame)
-            yield buffer.tobytes()
-            time.sleep(0.1)
+    return not (x2 < x3 or x4 < x1 or y2 < y3 or y4 < y1)
+
+def manage_priorities():
+    """Check for emergency/accident and manage priority status"""
+    global system_status
     
-    cap = cv2.VideoCapture(video_source)
+    current_time = time.time()
     
-    # Check if video opened successfully
+    if current_time < system_status['cooldown_end_time']:
+        return
+    
+    if system_status['priority_mode'] == 'accident':
+        return # Accident mode requires manual reset
+    
+    # Check if a previously active emergency has ended
+    if system_status['priority_mode'] == 'emergency' and current_time >= system_status['priority_end_time']:
+        with lock:
+            system_status['priority_mode'] = 'normal'
+            system_status['active_lane'] = None
+            system_status['cooldown_end_time'] = current_time + PRIORITY_COOLDOWN
+        print(f"[PRIORITY] Emergency mode ended. Cooldown until {time.strftime('%H:%M:%S', time.localtime(system_status['cooldown_end_time']))}")
+        return
+
+    # Check for new emergency
+    emergency_lane = None
+    max_emergency_count = 0
+    with lock:
+        for lane_id in LANE_IDS:
+            if traffic_data[lane_id]['emergency_count'] >= EMERGENCY_PRIORITY_THRESHOLD:
+                if traffic_data[lane_id]['emergency_count'] > max_emergency_count:
+                    max_emergency_count = traffic_data[lane_id]['emergency_count']
+                    emergency_lane = lane_id
+    
+    if emergency_lane is not None:
+        with lock:
+            system_status['priority_mode'] = 'emergency'
+            system_status['active_lane'] = emergency_lane
+            system_status['priority_end_time'] = current_time + EMERGENCY_GREEN_TIME
+        print(f"[PRIORITY] Emergency activated for Lane {emergency_lane}! Green time: {EMERGENCY_GREEN_TIME}s")
+
+def process_video_for_lane(lane_id, video_path):
+    cap = cv2.VideoCapture(video_path)
+
     if not cap.isOpened():
-        logger.error(f"Failed to open video: {video_source}")
-        lanes_data[lane_id]['status'] = 'error'
-        while True:
-            frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(frame, f"Failed to open video", (50, 240), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            ret, buffer = cv2.imencode('.jpg', frame)
-            yield buffer.tobytes()
-            time.sleep(0.1)
+        print(f"[ERROR] Could not open video for lane {lane_id}: {video_path}")
+        return
+
+    print(f"[INFO] Started processing for lane {lane_id}...")
     
-    # Set a lower resolution for better performance if needed
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    
-    frame_count = 0
-    process_every_n_frames = 2  # Process every 2nd frame to improve performance
-    
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            # Reset video to start if we reach the end
+    prev_positions = defaultdict(lambda: deque(maxlen=5)) # For sudden stop detection
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             continue
 
-        frame_count += 1
+        current_time = time.time()
         
-        # Skip processing for some frames to improve performance
-        if frame_count % process_every_n_frames != 0:
-            # Still yield the frame but without processing
-            ret, buffer = cv2.imencode('.jpg', frame)
-            yield buffer.tobytes()
-            continue
+        with yolo_lock:
+            results = MODEL.track(frame, persist=True, verbose=False,
+                                  classes=VEHICLE_CLASSES + EMERGENCY_CLASSES)
 
-        # Run YOLOv8 inference if model is available
         current_counts = defaultdict(int)
-        if model:
-            try:
-                results = model.track(frame, persist=True, verbose=False, classes=VEHICLE_CLASSES)
-                
-                if results[0].boxes is not None and results[0].boxes.id is not None:
-                    boxes = results[0].boxes.xyxy.cpu().numpy()
-                    class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
-                    
-                    for box, class_id in zip(boxes, class_ids):
-                        label = class_names[class_id]
-                        if label in ['car', 'bus', 'truck', 'motorcycle']:
-                            current_counts[label] += 1
-            except Exception as e:
-                logger.error(f"YOLO inference error in lane {lane_id}: {e}")
-        else:
-            # Fallback detection if model is not available
-            # This is a simple placeholder - in a real scenario you'd implement proper fallback
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            blur = cv2.GaussianBlur(gray, (5, 5), 0)
-            _, thresh = cv2.threshold(blur, 100, 255, cv2.THRESH_BINARY)
-            contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Count contours of a certain size as vehicles
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if 500 < area < 5000:
-                    current_counts['car'] += 1
+        emergency_count = 0
+        accident_detected = False
+        accident_location = None
+        current_tracked_ids = set()
 
-        # Update lane data
-        total_vehicles = sum(current_counts.values())
+        if results and results[0].boxes.id is not None:
+            track_ids = results[0].boxes.id.cpu().numpy().astype(int)
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+            confidences = results[0].boxes.conf.cpu().numpy()
+
+            for box, track_id, cid, conf in zip(boxes, track_ids, class_ids, confidences):
+                label = CLASS_NAMES[cid]
+                current_counts[label] += 1
+                current_tracked_ids.add(track_id)
+                
+                # Update tracked object history
+                x1, y1, x2, y2 = map(int, box)
+                center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
+                
+                # Check for emergency vehicle
+                if cid in EMERGENCY_CLASSES and conf > 0.6:
+                    emergency_count += 1
+                    color = (0, 0, 255)
+                    thickness = 3
+                else:
+                    color = (0, 255, 0)
+                    thickness = 2
+                
+                # Check for sudden stop
+                prev_positions[track_id].append({'pos': (center_x, center_y), 'time': current_time})
+                if len(prev_positions[track_id]) >= 3:
+                    p1 = prev_positions[track_id][-3]
+                    p2 = prev_positions[track_id][-2]
+                    p3 = prev_positions[track_id][-1]
+                    dist_1_2 = np.sqrt((p2['pos'][0] - p1['pos'][0])**2 + (p2['pos'][1] - p1['pos'][1])**2)
+                    dist_2_3 = np.sqrt((p3['pos'][0] - p2['pos'][0])**2 + (p3['pos'][1] - p2['pos'][1])**2)
+                    
+                    if dist_1_2 > 20 and dist_2_3 < 5: # Was moving, now stopped
+                        accident_detected = True
+                        accident_location = (float(center_x), float(center_y)) # FIX APPLIED HERE
+                        break
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Check for bounding box overlap (collision)
+            if not accident_detected:
+                for i in range(len(boxes)):
+                    for j in range(i + 1, len(boxes)):
+                        if check_overlap(boxes[i], boxes[j]) and confidences[i] > 0.5 and confidences[j] > 0.5:
+                            accident_detected = True
+                            # FIX: Convert numpy.float32 values to standard floats
+                            accident_location = (float((boxes[i][0]+boxes[i][2])/2), float((boxes[i][1]+boxes[i][3])/2))
+                            break
+                    if accident_detected:
+                        break
+
+        total = sum(current_counts.values())
         
         with lock:
-            lanes_data[lane_id]['current_counts'] = current_counts
-            lanes_data[lane_id]['total_count'] = total_vehicles
-            lanes_data[lane_id]['last_update'] = time.time()
+            has_emergency = system_status['priority_mode'] == 'emergency' and system_status['active_lane'] == lane_id
             
-            # Update history every 5 seconds
-            current_time = time.time()
-            if (len(lanes_data[lane_id]['time_labels']) == 0 or 
-                current_time - lanes_data[lane_id]['time_labels'][-1] > 5):
-                lanes_data[lane_id]['density_history'].append(total_vehicles)
-                lanes_data[lane_id]['timing_history'].append(lanes_data[lane_id]['green_time_remaining'])
-                lanes_data[lane_id]['time_labels'].append(datetime.fromtimestamp(current_time).strftime("%H:%M:%S"))
-                
-                # Keep limited history
-                if len(lanes_data[lane_id]['density_history']) > 20:
-                    lanes_data[lane_id]['density_history'].pop(0)
-                    lanes_data[lane_id]['timing_history'].pop(0)
-                    lanes_data[lane_id]['time_labels'].pop(0)
+            traffic_data[lane_id]['has_emergency'] = has_emergency
+            traffic_data[lane_id]['vehicle_count_history'].append(total)
+            traffic_data[lane_id]['accident_detected'] = accident_detected
+            traffic_data[lane_id]['accident_location'] = accident_location
+            
+            if accident_detected:
+                system_status['priority_mode'] = 'accident'
+                system_status['active_lane'] = lane_id
 
-        # Add traffic light visualization to frame
-        light_color = lanes_data[lane_id]['current_light']
-        light_colors = {'RED': (0, 0, 255), 'YELLOW': (0, 255, 255), 'GREEN': (0, 255, 0)}
+        smoothed_gtime = smooth_green_time_transition(lane_id, current_time)
         
-        # Draw traffic light
-        cv2.rectangle(frame, (10, 10), (60, 160), (50, 50, 50), -1)
-        cv2.circle(frame, (35, 35), 15, light_colors['RED'], -1 if light_color == 'RED' else -1)
-        cv2.circle(frame, (35, 80), 15, light_colors['YELLOW'], -1 if light_color == 'YELLOW' else -1)
-        cv2.circle(frame, (35, 125), 15, light_colors['GREEN'], -1 if light_color == 'GREEN' else -1)
+        if system_status['priority_mode'] == 'accident':
+            status_text = "ACCIDENT DETECTED"
+            status_color = (0, 0, 255)
+            cv2.putText(frame, "❗ ACCIDENT DETECTED ❗", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+            info = f"Lane {lane_id} - Accident Location: ({int(accident_location[0])},{int(accident_location[1])})" if accident_location else "N/A"
+            cv2.putText(frame, info, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        else:
+            status_color = (0, 0, 255) if has_emergency else (255, 255, 255)
+            status_text = "EMERGENCY PRIORITY" if has_emergency else "NORMAL"
+            cv2.putText(frame, f"Lane {lane_id} - {status_text}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+            
+            info = f"Total: {total} | Emergency: {emergency_count} | Green: {smoothed_gtime}s"
+            cv2.putText(frame, info, (10, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
-        # Add info text
-        cv2.putText(frame, f"Lane {lane_id} - {light_color}", (70, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, light_colors[light_color], 2)
-        cv2.putText(frame, f"Vehicles: {total_vehicles}", (70, 60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"Time: {lanes_data[lane_id]['green_time_remaining']}s", (70, 90), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        if emergency_count > 0:
+            cv2.putText(frame, "🚑 EMERGENCY VEHICLE DETECTED", (10, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        # Encode frame for streaming
-        ret, buffer = cv2.imencode('.jpg', frame)
-        yield buffer.tobytes()
+        ret, buf = cv2.imencode(".jpg", frame)
+        frame_bytes = buf.tobytes()
 
-    cap.release()
+        with lock:
+            lane = traffic_data[lane_id]
+            lane["current_counts"] = current_counts
+            lane["emergency_count"] = emergency_count
+            lane["total_count"] = total
+            lane["green_time"] = smoothed_gtime
+            now = time.time()
+            last = lane["time_labels"][-1] if lane["time_labels"] else 0
+            if now - last > 5:
+                lane["density_history"].append(total)
+                lane["timing_history"].append(smoothed_gtime)
+                lane["time_labels"].append(now)
+            
+            lane["latest_frame"] = frame_bytes
+        
+# --- Emergency/Accident Monitoring Thread ---
+def priority_monitor():
+    """Continuously monitor for emergency vehicles and accidents and manage priority"""
+    while True:
+        manage_priorities()
+        time.sleep(1)
 
-def generate_frames(lane_id):
-    """Generator function for video streaming"""
-    return process_lane_video(lane_id)
-
-@app.route('/')
+# --- Flask Routes ---
+@app.route("/")
 def index():
-    return render_template('index.html', lanes=[1, 2, 3, 4])
+    return render_template("index.html", lanes=LANE_IDS)
 
-@app.route('/video_feed/<int:lane_id>')
+@app.route("/upload_and_process", methods=["POST"])
+def upload_and_process():
+    global video_sources
+    uploaded_files = request.files.to_dict()
+    if not uploaded_files:
+        return jsonify({"error": "No files uploaded"}), 400
+
+    video_sources = {}
+    for lane_name, file_storage in uploaded_files.items():
+        if file_storage.filename != '':
+            lane_id = int(lane_name.replace('lane', ''))
+            filename = secure_filename(file_storage.filename)
+            filepath = os.path.join(UPLOAD_FOLDER, filename)
+            file_storage.save(filepath)
+            video_sources[lane_id] = filepath
+
+    if not video_sources:
+        return jsonify({"error": "No video files provided"}), 400
+
+    for lid in video_sources.keys():
+        t = threading.Thread(target=process_video_for_lane,
+                             args=(lid, video_sources[lid]), daemon=True)
+        t.start()
+
+    priority_thread = threading.Thread(target=priority_monitor, daemon=True)
+    priority_thread.start()
+
+    print("[SYSTEM] Traffic monitoring system started with uploaded videos")
+    print("[SYSTEM] Emergency classes being monitored:", [CLASS_NAMES[c] for c in EMERGENCY_CLASSES])
+    
+    return jsonify({
+        "status": "success",
+        "message": "Videos uploaded and processing started.",
+        "processed_lanes": list(video_sources.keys())
+    })
+
+def generate_video_stream(lane_id):
+    while True:
+        time.sleep(0.03)
+        with lock:
+            frame = traffic_data[lane_id]["latest_frame"]
+        if frame is None:
+            continue
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+               frame + b"\r\n")
+
+@app.route("/video_feed/<int:lane_id>")
 def video_feed(lane_id):
-    return Response(generate_frames(lane_id),
-                   mimetype='multipart/x-mixed-replace; boundary=frame')
+    if lane_id not in LANE_IDS:
+        return "Invalid Lane ID", 404
+    return Response(generate_video_stream(lane_id),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
 
-@app.route('/traffic_data')
+@app.route("/traffic_data")
 def get_traffic_data():
     with lock:
-        data = {
+        payload = {
             'lanes': {},
-            'current_green_lane': current_green_lane,
-            'system_time': datetime.now().strftime("%H:%M:%S"),
-            'system_uptime': int(time.time() - system_start_time),
-            'emergency_mode': emergency_mode
+            'system_status': system_status.copy()
         }
         
-        for lane_id in range(1, 5):
-            data['lanes'][lane_id] = {
-                'counts': dict(lanes_data[lane_id]['current_counts']),
-                'total': lanes_data[lane_id]['total_count'],
-                'light': lanes_data[lane_id]['current_light'],
-                'green_time': lanes_data[lane_id]['green_time_remaining'],
-                'density_history': lanes_data[lane_id]['density_history'],
-                'timing_history': lanes_data[lane_id]['timing_history'],
-                'time_labels': lanes_data[lane_id]['time_labels'],
-                'status': lanes_data[lane_id]['status'],
-                'last_update': lanes_data[lane_id]['last_update']
-            }
+        system_status_readable = system_status.copy()
+        system_status_readable['priority_end_time'] = time.strftime("%H:%M:%S", time.localtime(system_status['priority_end_time'])) if system_status['priority_end_time'] > 0 else "N/A"
+        system_status_readable['cooldown_end_time'] = time.strftime("%H:%M:%S", time.localtime(system_status['cooldown_end_time'])) if system_status['cooldown_end_time'] > 0 else "N/A"
+        payload['system_status'] = system_status_readable
+        
+        for lid, data in traffic_data.items():
+            d = {k: v for k, v in data.items() if k not in ["latest_frame", "tracked_objects"]}
+            d["density_history"] = list(d["density_history"])
+            d["timing_history"] = list(d["timing_history"])
+            d["time_labels"] = [time.strftime("%H:%M:%S", time.localtime(ts)) for ts in d["time_labels"]]
+            d["vehicle_count_history"] = list(d["vehicle_count_history"])
+            payload['lanes'][lid] = d
     
-    return jsonify(data)
+    return jsonify(payload)
 
-@app.route('/manual_switch', methods=['POST'])
-def manual_switch():
-    global current_green_lane, light_change_time
-    with lock:
-        # Switch to next lane
-        next_lane = current_green_lane % 4 + 1
-        
-        # Set current lane to red
-        lanes_data[current_green_lane]['current_light'] = 'RED'
-        
-        # Set next lane to green
-        current_green_lane = next_lane
-        lanes_data[current_green_lane]['current_light'] = 'GREEN'
-        
-        # Calculate new green time based on current traffic
-        vehicle_count = lanes_data[current_green_lane]['total_count']
-        new_green_time = calculate_green_time(vehicle_count)
-        lanes_data[current_green_lane]['green_time_remaining'] = new_green_time
-        
-        light_change_time = time.time()
-        
-        logger.info(f"Manual switch to Lane {current_green_lane} with {new_green_time}s green time")
-    
-    return jsonify({'message': f'Switched to lane {current_green_lane}', 'success': True})
-
-@app.route('/emergency_mode', methods=['POST'])
-def toggle_emergency_mode():
-    global emergency_mode
-    emergency_mode = not emergency_mode
-    
-    if emergency_mode:
-        logger.info("Emergency mode activated")
-        return jsonify({'message': 'Emergency mode activated', 'emergency_mode': True})
-    else:
-        logger.info("Emergency mode deactivated")
-        # Reset light change time to resume normal operation
-        global light_change_time
-        light_change_time = time.time()
-        return jsonify({'message': 'Emergency mode deactivated', 'emergency_mode': False})
-
-@app.route('/reset_system', methods=['POST'])
-def reset_system():
-    global current_green_lane, light_change_time, emergency_mode
+@app.route("/emergency_override/<int:lane_id>", methods=["POST"])
+def emergency_override(lane_id):
+    """Manual emergency override endpoint"""
+    if lane_id not in LANE_IDS:
+        return jsonify({"error": "Invalid lane ID"}), 400
     
     with lock:
-        emergency_mode = False
-        current_green_lane = 1
-        light_change_time = time.time()
+        system_status['priority_mode'] = 'emergency'
+        system_status['active_lane'] = lane_id
+        system_status['priority_end_time'] = time.time() + EMERGENCY_GREEN_TIME
+        system_status['cooldown_end_time'] = 0
         
-        for lane_id in range(1, 5):
-            lanes_data[lane_id]['current_light'] = 'RED'
-            lanes_data[lane_id]['green_time_remaining'] = 0
-        
-        # Set first lane as green
-        lanes_data[1]['current_light'] = 'GREEN'
-        lanes_data[1]['green_time_remaining'] = MIN_GREEN_TIME
-        
-        logger.info("System reset")
+        traffic_data[lane_id]['current_green_time'] = EMERGENCY_GREEN_TIME
+        traffic_data[lane_id]['target_green_time'] = EMERGENCY_GREEN_TIME
     
-    return jsonify({'message': 'System reset successfully', 'success': True})
+    print(f"[MANUAL OVERRIDE] Emergency priority activated for Lane {lane_id}")
+    return jsonify({
+        "status": "success",
+        "message": f"Emergency priority activated for Lane {lane_id}",
+        "green_time": EMERGENCY_GREEN_TIME
+    })
 
-@app.route('/set_green_time', methods=['POST'])
-def set_green_time():
-    lane_id = request.json.get('lane_id')
-    green_time = request.json.get('green_time')
-    
-    if not lane_id or not green_time:
-        return jsonify({'message': 'Missing parameters', 'success': False}), 400
-    
-    if lane_id not in [1, 2, 3, 4]:
-        return jsonify({'message': 'Invalid lane ID', 'success': False}), 400
-    
-    try:
-        green_time = int(green_time)
-        if green_time < MIN_GREEN_TIME or green_time > MAX_GREEN_TIME:
-            return jsonify({'message': f'Green time must be between {MIN_GREEN_TIME} and {MAX_GREEN_TIME}', 'success': False}), 400
-    except ValueError:
-        return jsonify({'message': 'Green time must be a number', 'success': False}), 400
-    
+@app.route("/clear_emergency", methods=["POST"])
+def clear_emergency():
+    """Clear emergency priority manually"""
     with lock:
-        lanes_data[lane_id]['green_time_remaining'] = green_time
-        logger.info(f"Set green time for lane {lane_id} to {green_time}s")
+        system_status['priority_mode'] = 'normal'
+        system_status['active_lane'] = None
+        system_status['cooldown_end_time'] = time.time() + PRIORITY_COOLDOWN
     
-    return jsonify({'message': f'Green time for lane {lane_id} set to {green_time}s', 'success': True})
+    print("[MANUAL OVERRIDE] Emergency priority cleared")
+    return jsonify({
+        "status": "success",
+        "message": "Emergency priority cleared"
+    })
 
-# Start traffic light management thread
-traffic_light_thread = threading.Thread(target=manage_traffic_lights, daemon=True)
-traffic_light_thread.start()
-
-# Initialize first lane as green
-with lock:
-    lanes_data[1]['current_light'] = 'GREEN'
-    lanes_data[1]['green_time_remaining'] = MIN_GREEN_TIME
-    light_change_time = time.time()
-
-if __name__ == '__main__':
-    # Check if videos directory exists
-    if not os.path.exists('videos'):
-        os.makedirs('videos')
-        logger.warning("Videos directory created. Please add your video files.")
+@app.route("/clear_accident", methods=["POST"])
+def clear_accident():
+    """Manually clear an accident alert"""
+    with lock:
+        for lane_id in LANE_IDS:
+            traffic_data[lane_id]['accident_detected'] = False
+            traffic_data[lane_id]['accident_location'] = None
+        system_status['priority_mode'] = 'normal'
+        system_status['active_lane'] = None
+        system_status['cooldown_end_time'] = time.time() + PRIORITY_COOLDOWN
     
-    app.run(debug=True, host='0.0.0.0', port=3001, threaded=True)
+    print("[MANUAL OVERRIDE] Accident alert cleared")
+    return jsonify({
+        "status": "success",
+        "message": "Accident alert cleared and system reset."
+    })
+
+if __name__ == "__main__":
+    app.run(debug=False, host="0.0.0.0", port=3001, threaded=True)
